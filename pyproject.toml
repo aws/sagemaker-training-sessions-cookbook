@@ -1,0 +1,60 @@
+[project]
+name = "training-sessions-cookbook"
+version = "0.1.0"
+description = "SFT and RL training cookbooks for SageMaker Training Sessions."
+readme = "README.md"
+requires-python = ">=3.11"
+
+# The training-session PySDK (sagemaker-train) ships as a wheel, not on PyPI,
+# so it is installed separately (see README.md "Setup"). It pulls in
+# the sagemaker + boto3 + transformers stack it needs; we list boto3/sagemaker
+# here too so a fresh env resolves them even if the wheel's deps drift.
+dependencies = [
+    # Console rendering (log formatting, run banner). The trainers degrade to
+    # plain text without it, but it is a first-class part of the terminal UX.
+    "rich",
+    "sagemaker",
+    "boto3",
+    "numpy==2.5.0",
+    "transformers==5.5.4",
+    "pyarrow",
+    "psutil>=5.9,<7",
+    "pydantic",
+    "typing_extensions",
+]
+
+[project.optional-dependencies]
+# matplotlib is only needed for post-processing plots (sft/analyze.py,
+# tools/plot_metrics.py). Training runs fine without it.
+plots = [
+    "matplotlib",
+]
+# aiohttp + datasets are only needed for the Code RL env (--env_type code_rl);
+# they are imported lazily so GSM8K runs (the default) work without them.
+code-rl = [
+    "aiohttp",
+    "datasets",
+]
+# mlflow + the sagemaker-mlflow auth plugin are only needed when publishing
+# training metrics to MLflow via --mlflow_tracking_uri (a SageMaker managed
+# MLflow App ARN or any MLflow tracking URI). Imported lazily; training runs
+# fine without them.
+mlflow = [
+    "mlflow",
+    "sagemaker-mlflow",
+]
+dev = [
+    "pytest>=8.0.0",
+    "hypothesis>=6.0.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["training_sessions_cookbook"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]

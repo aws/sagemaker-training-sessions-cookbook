@@ -1,0 +1,46 @@
+# Standalone RL cookbook runtime requirements (SageMaker Training
+# Sessions service backend).
+#
+# The training-session PySDK ships as a wheel, not on PyPI, so it is installed
+# separately (see README.md "Setup"):
+#   pip install sagemaker-train-<version>-py3-none-any.whl
+# It pulls in the sagemaker + boto3 stack it needs. We list boto3/sagemaker
+# here as well so a fresh env resolves them even if the wheel's deps drift.
+sagemaker
+boto3
+
+# Direct deps of this cookbook.
+numpy==2.5.0
+transformers==5.5.4
+pyarrow
+psutil>=5.9,<7
+pydantic
+typing_extensions
+
+# matplotlib is only needed by tools/plot_metrics.py (post-processing
+# visualization). It is NOT imported by the training loops, so training runs
+# fine without it; install it only if you want to generate training plots.
+matplotlib
+
+# aiohttp and datasets are ONLY needed for the Code RL env (--env_type code_rl).
+# They are imported lazily, so GSM8K runs (the default) do not need them and run
+# fine without them installed. Install these only if you plan to run Code RL:
+#   - aiohttp:  HTTP backend for the SandboxFusion client (envs/sandbox.py).
+#   - datasets: loads the DeepCoder dataset (envs/deepcoder.py).
+aiohttp
+datasets
+
+# mlflow and sagemaker-mlflow are ONLY needed when publishing training metrics
+# to a SageMaker managed MLflow tracking server / MLflow App via
+# --mlflow_tracking_uri. They are imported lazily and publishing is
+# best-effort, so training runs fine without them installed.
+#   - mlflow:           the MLflow client (mlflow.log_metrics / log_params).
+#   - sagemaker-mlflow: auth plugin that lets mlflow.set_tracking_uri accept
+#                       the SageMaker MLflow resource ARN and sign requests
+#                       with your AWS credentials.
+mlflow
+sagemaker-mlflow
+
+# Console rendering for the trainers (colorized logs, run banner).
+# Training degrades to plain text without it.
+rich

@@ -1,0 +1,4 @@
+{"step": 100, "model_package_arn": "arn:aws:sagemaker:us-west-2:ACCOUNT_ID:model-package/sft-tulu3/12"}
+{"step": 200, "model_package_arn": "arn:aws:sagemaker:us-west-2:ACCOUNT_ID:model-package/sft-tulu3/13"}
+{"step": 300, "model_package_arn": "arn:aws:sagemaker:us-west-2:ACCOUNT_ID:model-package/sft-tulu3/14"}
+{"step": 400, "name": "final", "model_package_arn": "arn:aws:sagemaker:us-west-2:ACCOUNT_ID:model-package/sft-tulu3/15"}

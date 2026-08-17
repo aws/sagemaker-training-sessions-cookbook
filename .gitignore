@@ -1,0 +1,23 @@
+**/__pycache__
+.DS_Store
+.env
+.env.*
+.venv
+uv.lock
+.hypothesis/
+.pytest_cache/
+.coverage
+
+# Training run outputs (metrics, plots, transcripts).
+logs/
+runs/
+
+# Design/investigation docs — kept out of the cookbook.
+docs/
+
+# Claude Code agent worktree scratch.
+.claude/
+
+# Local-only experiment outputs (not part of the public cookbook).
+results/rl_gsm8k_3way_comparison/
+results/rl_rlfd_seqrl_smoke/
