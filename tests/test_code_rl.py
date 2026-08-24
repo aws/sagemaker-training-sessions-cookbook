@@ -184,7 +184,15 @@ def test_sync_step_raises_not_implemented():
 # ===========================================================================
 
 
-def test_multi_turn_reset_includes_tool_schema():
+def test_multi_turn_reset_returns_tools_as_data():
+    """Multi-turn reset exposes the tool specs via ``info["tools"]``.
+
+    The schema must NOT be baked into the observation string: the previous
+    behaviour concatenated a fully framed system/developer turn into the
+    observation, which the prompt template then nested inside the user message,
+    so every episode started with a malformed turn-1 prompt. The template layer
+    owns framing; the env only advertises which tools exist.
+    """
     env = CodeRLEnv(
         dataset=[_task()],
         max_turns=2,
@@ -192,9 +200,9 @@ def test_multi_turn_reset_includes_tool_schema():
         model_name="openai/gpt-oss-20b",
     )
     obs, info = env.reset()
-    assert "prob" in obs
-    assert "check_solution" in obs
-    assert info == {"env_type": "code_rl"}
+    assert obs == "prob", "observation must be the bare problem text"
+    assert info["env_type"] == "code_rl"
+    assert [t["name"] for t in info["tools"]] == ["check_solution"]
 
 
 def test_multi_turn_two_turns_then_done():

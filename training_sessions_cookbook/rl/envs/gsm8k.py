@@ -252,13 +252,19 @@ BUILTIN_GSM8K_20: list[dict] = [
 def _gsm8k_extract_answer(text: str, answer_format: str = "hash") -> Optional[str]:
     """Extract the final GSM8K answer from a model response.
 
-    Clips to the trailing 300 chars, runs every regex registered for `answer_format` in order, and returns the last match across all matched patterns. `,` and `$` are stripped so numeric comparison is normalization-safe. Returns `None` when no pattern matches.
+    Runs every regex registered for `answer_format` in order over the FULL
+    response and returns the last match across all matched patterns. `,` and
+    `$` are stripped so numeric comparison is normalization-safe. Returns
+    `None` when no pattern matches.
+
+    The previous 300-char tail clip is gone: it silently scored a correct
+    answer as 0.0 whenever the model added more than 300 chars of prose after
+    its `#### N` line (verified on real extractions). Its purpose - prefer the
+    model's LAST stated answer - is already provided by last-match semantics,
+    so the clip only ever lost answers, never found extra ones.
 
     `auto` tries every known format; the priority order in `_FORMAT_PATTERNS` breaks ties when a single response contains multiple distinct markers (rare; usually the model commits to one shape).
     """
-    _SOLUTION_CLIP_CHARS = 300
-    if len(text) > _SOLUTION_CLIP_CHARS:
-        text = text[-_SOLUTION_CLIP_CHARS:]
     patterns = _FORMAT_PATTERNS.get(answer_format, _FORMAT_PATTERNS["hash"])
     last_match: Optional[str] = None
     for pat in patterns:
@@ -301,7 +307,24 @@ def _gsm8k_compute_score(
     answer = _gsm8k_extract_answer(action, answer_format=answer_format)
     if answer is None:
         return 0.0
-    return 1.0 if answer == _gsm8k_normalize_gt(ground_truth) else format_score
+    return 1.0 if _gsm8k_answers_equal(answer, _gsm8k_normalize_gt(ground_truth)) else format_score
+
+
+def _gsm8k_answers_equal(answer: str, ground_truth: str) -> bool:
+    """Compare an extracted answer against the ground truth numerically.
+
+    GSM8K answers are numbers; string equality graded ``7.0`` vs ``7`` (or
+    ``.5`` vs ``0.5``) as WRONG, punishing a numerically correct model for its
+    formatting - measured on real extractions before this fix. Values that do
+    not parse as floats fall back to exact string comparison rather than
+    guessing.
+    """
+    if answer == ground_truth:
+        return True
+    try:
+        return float(answer) == float(ground_truth)
+    except (TypeError, ValueError):
+        return False
 
 
 class GSM8KMultiTurnEnv:

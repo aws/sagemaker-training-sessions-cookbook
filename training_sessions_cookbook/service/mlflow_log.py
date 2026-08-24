@@ -37,7 +37,7 @@ import logging
 import numbers
 import os
 import re
-from typing import Any, Optional
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 

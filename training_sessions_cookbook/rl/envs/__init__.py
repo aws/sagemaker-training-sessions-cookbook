@@ -25,6 +25,8 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 from .base import Env, Message, ToolCall, Transition
+from ..config import cfg
+from ..runstate import shared_dataset
 
 __all__ = [
     "Env",
@@ -109,8 +111,8 @@ def _gsm8k_factory_builder(args):
 
     return lambda: GSM8KMultiTurnEnv(
         max_turns=args.max_turns,
-        dataset=getattr(args, "_dataset", None),
-        answer_format=getattr(args, "answer_format", "hash"),
+        dataset=shared_dataset(args),
+        answer_format=cfg(args, "answer_format"),
     )
 
 

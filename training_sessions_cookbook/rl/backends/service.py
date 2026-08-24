@@ -16,13 +16,15 @@ Design notes:
 
 * **Async-native.** Training operations submit instantly (the SDK runs
   submission on a background thread) and are awaited via their futures;
-  sampling uses the SDK's coroutine API directly. Every wait is bounded by
-  ``OP_TIMEOUT_SECONDS`` so a server-side stall surfaces as a fail-fast
-  ``TimeoutError`` instead of an indefinite hang.
+  sampling uses the SDK's coroutine API directly. Waits are unbounded by
+  default: the service bounds and retries the work itself, so a client-side
+  ceiling would end a session that is merely queued. Set
+  ``OP_TIMEOUT_SECONDS`` to restore one.
 
-* **Sampler refresh.** ``save_weights_for_sampler`` publishes a non-merged
-  adapter checkpoint that auto-binds the session's sample path; the *same*
-  reused ``SamplingClient`` reflects the update on its next request. The save
+* **Sampler refresh.** ``save_weights_and_get_sampling_client`` publishes a
+  non-merged adapter checkpoint, explicitly binds it to the session's sampling
+  path, and returns an ARN-bound client; the loop swaps to the returned client
+  each refresh (an ARN-less request samples the BASE model). The save
   happens inside :meth:`refresh_sampler` (gated by the loop's
   ``--refresh_every``) so the on/off-policy timeline follows that cadence.
 
@@ -33,8 +35,8 @@ Design notes:
 
 * **Deploy -> invoke.** Durable checkpoints are the training loop's concern
   (``service/checkpoint_utils.py``); the loop records the final deployable
-  adapter package here via :meth:`note_deployable_checkpoint`, and
-  :meth:`deploy_and_invoke` (opt-in) then stands up a real-time SageMaker
+  adapter package here via :meth:`note_deployable_checkpoint` for
+  the run log records the final deployable adapter package for SageMaker
   endpoint with the trained LoRA adapter as an inference component.
 """
 
@@ -46,19 +48,69 @@ import os
 import time
 from typing import Any, Optional
 
-import boto3  # used by deploy_and_invoke
-import sagemaker  # used by deploy_and_invoke
 from sagemaker.train.training_session import AdamParams, LossFunction, SamplingParams
 
 from training_sessions_cookbook.service import make_datum, open_session
 
 from .base import build_loss_fn_config, resolve_sampling_extras
+from ..config import cfg
 
 logger = logging.getLogger(__name__)
 
-# Per-operation wait ceiling. Bounds every future/coroutine wait so a
-# server-side stall fails fast instead of hanging. Overridable via env.
-OP_TIMEOUT_SECONDS = float(os.environ.get("OP_TIMEOUT_SECONDS", "600"))
+def _resolve_op_timeout(env_var: str = "OP_TIMEOUT_SECONDS") -> float | None:
+    """Read the per-operation wait ceiling from the environment.
+
+    ``None`` (the default) means wait for the service. That is deliberate: the
+    service already bounds the work, and a client ceiling below the service's own
+    envelope turns *slow* into *dead* without reclaiming anything.
+
+    * A training operation is bounded per attempt by the session manager
+      (10 minutes for ``forward_backward``, 5 for ``optim_step`` and
+      ``save_weights``) and retried a few times, so a genuinely stuck operation
+      comes back ``Failed`` on its own. Giving up sooner is strictly worse:
+      operations execute in sequence order, so the only thing a client-side
+      expiry can do is end the session, and the abandoned operation keeps
+      running on the engine regardless.
+    * A sample request has no per-request service ceiling; the session's own
+      lifetime is the outer bound. Waiting therefore trades a fast local signal
+      for not discarding a rollout that is merely queued behind other tenants.
+
+    Set ``OP_TIMEOUT_SECONDS`` to a positive number of seconds to restore a
+    ceiling (useful when a run should fail rather than sit in a queue); ``0``,
+    an empty value, or ``none`` keep the wait unbounded.
+    """
+    raw = os.environ.get(env_var, "").strip()
+    if not raw or raw.lower() == "none":
+        return None
+    value = float(raw)
+    return value if value > 0 else None
+
+
+def _resolve_class_timeout(env_var: str) -> float | None:
+    """Per-class ceiling: the class-specific env var wins, else the shared one.
+
+    Training operations and sample requests have different waiting economics
+    (see :func:`_resolve_op_timeout`): training ops are bounded per attempt by
+    the session manager so a client ceiling mostly turns *slow* into *dead*,
+    while sample requests can legitimately queue behind other tenants for a
+    long time. ``TRAIN_OP_TIMEOUT_SECONDS`` / ``SAMPLE_OP_TIMEOUT_SECONDS``
+    override per class; ``OP_TIMEOUT_SECONDS`` is the shared fallback for both.
+
+    Called at BACKEND CONSTRUCTION, not at import: resolving env at import
+    froze the values for the process lifetime (an env change after import
+    silently did nothing) and forced tests to reload the module to exercise
+    different settings.
+    """
+    if os.environ.get(env_var, "").strip():
+        return _resolve_op_timeout(env_var)
+    return _resolve_op_timeout("OP_TIMEOUT_SECONDS")
+
+
+#: Sentinel distinguishing "not passed" from an explicit ``None``. ``None`` is
+#: a meaningful timeout value (unbounded), so it cannot double as "use the env
+#: default": a caller must be able to request unbounded waits even when
+#: ``OP_TIMEOUT_SECONDS`` is set in the environment.
+_UNSET: object = object()
 
 
 class _ServiceTrainStepResult:
@@ -80,7 +132,31 @@ class ServiceBackend:
     Construct via :meth:`create` (called by :func:`backends.make_backend`).
     """
 
-    def __init__(self, *, args, svc, tc, sampling_client, tokenizer, types) -> None:
+    def __init__(
+        self,
+        *,
+        args,
+        svc,
+        tc,
+        sampling_client,
+        tokenizer,
+        types,
+        train_op_timeout: "float | None | object" = _UNSET,
+        sample_op_timeout: "float | None | object" = _UNSET,
+    ) -> None:
+        # Per-op-class wait ceilings, injectable for programmatic callers and
+        # tests. Left unset, they resolve from the environment NOW (not at
+        # import); an explicit ``None`` means unbounded regardless of the env.
+        self._train_op_timeout = (
+            _resolve_class_timeout("TRAIN_OP_TIMEOUT_SECONDS")
+            if train_op_timeout is _UNSET
+            else train_op_timeout
+        )
+        self._sample_op_timeout = (
+            _resolve_class_timeout("SAMPLE_OP_TIMEOUT_SECONDS")
+            if sample_op_timeout is _UNSET
+            else sample_op_timeout
+        )
         self._args = args
         self._svc = svc  # ServiceClient (control plane)
         self._tc = tc  # TrainingClient
@@ -93,7 +169,13 @@ class ServiceBackend:
     # --- construction ------------------------------------------------------
 
     @classmethod
-    def create(cls, args) -> "ServiceBackend":
+    def create(
+        cls,
+        args,
+        *,
+        train_op_timeout: "float | None | object" = _UNSET,
+        sample_op_timeout: "float | None | object" = _UNSET,
+    ) -> "ServiceBackend":
         """Open a training session and create the reused sampling client.
 
         Validates the required service inputs, creates a LoRA training client
@@ -109,9 +191,9 @@ class ServiceBackend:
             "LossFunction": LossFunction,
         }
 
-        region = getattr(args, "region", "us-west-2")
+        region = cfg(args, "region")
         session_name = (
-            getattr(args, "training_session_name", None)
+            cfg(args, "training_session_name")
             or f"{args.run_name}-{int(time.time())}"
         )
 
@@ -134,8 +216,21 @@ class ServiceBackend:
         # session before re-raising: it was opened above, and no backend
         # object exists yet for the caller's teardown to close, so without
         # this the session would keep running unattended.
+        # Resolve the train-class ceiling once, before the setup call, so the
+        # initial save honours the same value (injected or env) the instance
+        # will use for every later training operation.
+        resolved_train_timeout = (
+            _resolve_class_timeout("TRAIN_OP_TIMEOUT_SECONDS")
+            if train_op_timeout is _UNSET
+            else train_op_timeout
+        )
         try:
-            tc.save_weights_for_sampler("initial").result(timeout=OP_TIMEOUT_SECONDS)
+            tc.save_weights_for_sampler("initial").result(timeout=resolved_train_timeout)
+            # ARN-less client = base model, which IS the correct step-0 policy
+            # (LoRA starts at zero delta). Every later refresh returns a NEW
+            # client bound to the fresh checkpoint (see refresh_sampler); this
+            # initial client is only ever used for step-0 rollouts and the
+            # optional val-at-start baseline.
             sampling_client = tc.create_sampling_client()
         except BaseException:
             try:
@@ -153,6 +248,8 @@ class ServiceBackend:
             sampling_client=sampling_client,
             tokenizer=tokenizer,
             types=types,
+            train_op_timeout=resolved_train_timeout,
+            sample_op_timeout=sample_op_timeout,
         )
         backend._session_name = session_name
         return backend
@@ -203,8 +300,12 @@ class ServiceBackend:
         """Sample one rollout via the SDK's coroutine API.
 
         ``sample_async`` submits without blocking the event loop, so all
-        concurrent rollouts reach the server and batch-fuse. The wait is
-        bounded externally so a stalled sample fails fast.
+        concurrent rollouts reach the server and batch-fuse. The wait honours
+        the sample-class ceiling (``SAMPLE_OP_TIMEOUT_SECONDS`` / ``OP_TIMEOUT_SECONDS``), unbounded by default: a sample request
+        has no per-request service ceiling, so a rollout queued behind other
+        tenants is waited out rather than discarded. With a ceiling configured,
+        expiry raises ``TimeoutError``, which the caller treats as a failed
+        rollout and drops.
         """
         return await asyncio.wait_for(
             sampling_client.sample_async(
@@ -212,35 +313,50 @@ class ServiceBackend:
                 num_samples=num_samples,
                 sampling_params=sampling_params,
             ),
-            OP_TIMEOUT_SECONDS,
+            self._sample_op_timeout,
         )
 
     # --- sampler lifecycle -------------------------------------------------
 
     def refresh_sampler(self, step: int) -> Any:
-        """Save sampler weights (auto-binds the sample path); return the reused client.
+        """Save weights, BIND them to the sampling path, and return a bound client.
 
-        On step 0 the initial weights saved in :meth:`create` already bound
-        the sample path, so the redundant save is skipped. Later refresh steps
-        save a non-merged adapter checkpoint; the session auto-binds it and
-        the reused ``SamplingClient`` reflects the new policy on its next
-        request; no new client needed.
+        The bind is explicit and load-bearing. ``save_weights_for_sampler``
+        alone only registers a checkpoint; it does not touch the sampling
+        path, and a sample request without a ``modelPackageArn`` samples the
+        BASE model (the SDK's documented contract). The previous
+        implementation relied on the service auto-binding each save to the
+        session's sample path - the pre-GA behavior - so after the service
+        change every rollout sampled frozen base weights for the whole run:
+        reward pinned at the base model's level with PPO clipping against a
+        never-moving behavior policy (measured: 40 flat steps on prod,
+        2026-08-24). ``save_weights_and_get_sampling_client`` performs the
+        save, issues the explicit ``loadWeightsForSampling`` bind, and returns
+        a client whose requests carry the checkpoint ARN.
+
+        On step 0 the initial client from :meth:`create` is returned as-is
+        (sampling the base model IS the correct step-0 policy).
         """
         if step > 0:
-            self._tc.save_weights_for_sampler(f"refresh-{step:06d}").result(
-                timeout=OP_TIMEOUT_SECONDS
+            self._sampling_client = self._tc.save_weights_and_get_sampling_client(
+                f"refresh-{step:06d}"
             )
         return self._sampling_client
 
     async def refresh_sampler_async(self, step: int) -> Any:
         """Non-blocking twin of :meth:`refresh_sampler` (overlapped loop).
 
-        Awaits the save through the SDK's async API so the event loop stays
-        free and rollout workers keep sampling during the save.
+        Same explicit save + bind + bound-client sequence (see
+        :meth:`refresh_sampler` for why the bind is load-bearing); the SDK's
+        async twin runs the blocking sequence on a worker thread so the event
+        loop stays free and rollout workers keep sampling during the save.
         """
         if step > 0:
-            op = await self._tc.save_weights_for_sampler_async(f"refresh-{step:06d}")
-            await asyncio.wait_for(op.result_async(), OP_TIMEOUT_SECONDS)
+            self._sampling_client = (
+                await self._tc.save_weights_and_get_sampling_client_async(
+                    f"refresh-{step:06d}"
+                )
+            )
         return self._sampling_client
 
     # --- training ----------------------------------------------------------
@@ -309,7 +425,10 @@ class ServiceBackend:
 
         Both operations are submitted back-to-back (the SDK assigns sequence
         numbers, so they run in order on the same session) and then awaited in
-        submission order, each wait bounded by ``OP_TIMEOUT_SECONDS``.
+        submission order, each wait honouring the train-class ceiling (unbounded
+        by default; the service bounds and retries these operations itself, and
+        a client-side expiry can only end the session because operations execute
+        in sequence order).
 
         Returns a result exposing ``.metrics``, with the optimizer step's
         metrics merged over the fwd/bwd metrics (the schema the training loop
@@ -332,8 +451,8 @@ class ServiceBackend:
             datums, loss_fn=self._loss_fn(loss_name), loss_fn_config=loss_fn_config
         )
         optim_op = await self._tc.optim_step_async(adam_params)
-        fb_result = await asyncio.wait_for(fwd_bwd_op.result_async(), OP_TIMEOUT_SECONDS)
-        opt_result = await asyncio.wait_for(optim_op.result_async(), OP_TIMEOUT_SECONDS)
+        fb_result = await asyncio.wait_for(fwd_bwd_op.result_async(), self._train_op_timeout)
+        opt_result = await asyncio.wait_for(optim_op.result_async(), self._train_op_timeout)
 
         # Merge optim metrics over fwd/bwd metrics so the train/* schema
         # carries both.
@@ -354,48 +473,8 @@ class ServiceBackend:
         return self._svc
 
     def note_deployable_checkpoint(self, model_package_arn) -> None:
-        """Record the deployable adapter package for :meth:`deploy_and_invoke`."""
+        """Record the final deployable adapter model package for the run log."""
         self._last_weights_model_package = model_package_arn
-
-    def deploy_and_invoke(self) -> Optional[dict]:
-        """Deploy the trained adapter to a real-time endpoint and invoke it.
-
-        Completes train -> checkpoint -> deploy -> invoke. Requires a
-        deployable adapter checkpoint (saved by the training loop when
-        ``--save_weights_at_end`` is set). Uses the
-        standard SageMaker Python SDK (``sagemaker`` / ``boto3``) hosting APIs:
-
-          1. Deploy the base JumpStart model to an inference-component endpoint
-             with LoRA hosting enabled.
-          2. Add the trained adapter as an inference component pointing at the
-             adapter's S3 weights URI (from the adapter model package).
-          3. Invoke the endpoint targeting the adapter component.
-
-        This is intentionally implemented as a thin, well-logged wrapper: the
-        exact JumpStart deploy call surface differs by model and account, so
-        we keep the moving parts explicit and fail loudly with next-steps
-        rather than silently. Returns a summary dict, or raises with guidance.
-        """
-        if not self._last_weights_model_package:
-            raise SystemExit(
-                "deploy_and_invoke requires a deployable checkpoint. Re-run with "
-                "--save_weights_at_end (or --deploy_and_invoke, which implies it)."
-            )
-
-        logger.info(
-            "deploy_and_invoke: base_model_arn=%s adapter_model_package=%s region=%s",
-            self._args.base_model_arn,
-            self._last_weights_model_package,
-            getattr(self._args, "region", "us-west-2"),
-        )
-        # The concrete deploy + inference-component wiring is account- and
-        # model-specific, so it is left as an explicit stub rather than
-        # guessed here.
-        raise NotImplementedError(
-            "Endpoint deploy is not implemented. The deployable adapter model "
-            f"package is: {self._last_weights_model_package}. Deploy it to a "
-            "real-time inference-component endpoint and wire the invoke calls here."
-        )
 
     def delete_session(self) -> None:
         """Delete the training session (stopping it first if still active).

@@ -10,14 +10,15 @@ the "SageMaker Training Sessions service" is expressed as a method here:
   concrete SDK types.
 * **sampler refresh**: ``refresh_sampler(step)`` snapshots the current policy
   weights and returns the ``sampling_client`` rollouts should use. The service
-  saves a (non-merged) checkpoint that auto-binds and hands back the *same*
-  reused client.
+  saves a (non-merged) checkpoint, EXPLICITLY binds it to the session's
+  sampling path, and returns a client whose requests carry the checkpoint ARN
+  (an ARN-less request samples the base model - relying on implicit binding
+  silently froze the sampler at base weights; see ServiceBackend.refresh_sampler).
 * **datum construction**: ``build_datum`` produces the backend-native training
   datum from a rollout ``Transition``.
 * **optimization**: ``train_step`` runs the pipelined forward/backward +
   optimizer step and returns the trainer metrics for the step.
 * **checkpoint clients + deploy**: ``training_client`` / ``service_client`` feed the loop's checkpoint manager;
-  ``deploy_and_invoke`` stands up an endpoint and invokes it.
 
 The sampling-result contract the loop relies on: the loop calls
 ``await backend.sample_async(sampling_client, prompt, num_samples=, sampling_params=)``
@@ -30,6 +31,7 @@ loop and awaits the result off-loop so many rollouts stay in-flight at once
 from __future__ import annotations
 
 from typing import Any, Optional, Protocol, runtime_checkable
+from ..config import cfg
 
 
 def resolve_sampling_extras(args: Any) -> dict:
@@ -42,13 +44,13 @@ def resolve_sampling_extras(args: Any) -> dict:
     is split into a ``list[str]`` here; empty segments are dropped.
     """
     extras: dict = {}
-    top_p = getattr(args, "top_p", None)
+    top_p = cfg(args, "top_p")
     if top_p is not None:
         extras["top_p"] = float(top_p)
-    top_k = getattr(args, "top_k", None)
+    top_k = cfg(args, "top_k")
     if top_k is not None:
         extras["top_k"] = int(top_k)
-    stop = getattr(args, "stop", None)
+    stop = cfg(args, "stop")
     if stop is not None:
         seqs = [s for s in str(stop).split(",") if s]
         if seqs:
@@ -69,8 +71,8 @@ def build_loss_fn_config(args: Any) -> Optional[dict]:
     just one bound. Applies to ``ppo`` and ``cispo``; ignored by
     ``importance_sampling`` (unclipped) on the SDK side.
     """
-    low = getattr(args, "clip_low_threshold", None)
-    high = getattr(args, "clip_high_threshold", None)
+    low = cfg(args, "clip_low_threshold")
+    high = cfg(args, "clip_high_threshold")
     if low is None and high is None:
         return None
     config: dict = {}
@@ -135,7 +137,8 @@ class TrainingBackend(Protocol):
         The returned result must expose ``.samples[i].tokens`` and
         ``.samples[i].logprobs``. Implementations must not block the event
         loop: submission and waiting go through the SDK's async API, with the
-        wait bounded so a stalled sample fails fast.
+        wait governed by the backend's train-class ceiling (unbounded by
+        default for the service backend).
         """
         ...
 
@@ -146,8 +149,9 @@ class TrainingBackend(Protocol):
 
         Called by the loop on every ``--refresh_every`` step (and at
         ``--val_at_start``). The returned object is what rollout coroutines
-        call ``.sample(...)`` on. Service returns the single reused client after
-        a weight save that auto-binds the sample path.
+        call ``.sample(...)`` on. The service backend returns a client bound to
+        the freshly saved checkpoint (save + explicit bind); callers must use
+        the RETURNED client, not a cached one.
         """
         ...
 
@@ -188,7 +192,8 @@ class TrainingBackend(Protocol):
         Coroutine (``await backend.train_step(...)``). Both operations are
         submitted back-to-back (pipelined on the session) and awaited in
         submission order without blocking the event loop; every wait is
-        bounded by ``OP_TIMEOUT_SECONDS``.
+        governed by the backend's sample-class ceiling (unbounded by default for the
+        service backend).
 
         Returns an object exposing ``.metrics`` (a ``dict[str, float]``, with
         the optim step's metrics merged over the fwd/bwd metrics), matching what
@@ -201,7 +206,7 @@ class TrainingBackend(Protocol):
     # Durable checkpoints are the training loop's concern (it drives a
     # ``service.checkpoint_utils.CheckpointManager``); the backend only
     # exposes the SDK clients the manager needs and records the deployable
-    # package for ``deploy_and_invoke``.
+    # package recorded on the run log.
 
     @property
     def training_client(self):
@@ -214,14 +219,7 @@ class TrainingBackend(Protocol):
         ...
 
     def note_deployable_checkpoint(self, model_package_arn) -> None:
-        """Record the final deployable adapter package (deploy_and_invoke)."""
-        ...
-
-    def deploy_and_invoke(self) -> Optional[dict]:
-        """Deploy the trained adapter and invoke it.
-
-        Returns ``None`` when endpoint deployment is not requested.
-        """
+        """Record the final deployable adapter model package for the run log."""
         ...
 
     def delete_session(self) -> None:

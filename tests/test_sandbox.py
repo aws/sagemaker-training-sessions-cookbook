@@ -59,9 +59,10 @@ class _FakeSession:
         self._resp = resp
         self._capture = capture
 
-    def post(self, url, json=None):
+    def post(self, url, json=None, timeout=None):
         self._capture["url"] = url
         self._capture["payload"] = json
+        self._capture["timeout"] = timeout
         return self._resp
 
 
@@ -71,7 +72,7 @@ class _RaisingSession:
     def __init__(self, exc):
         self._exc = exc
 
-    def post(self, url, json=None):
+    def post(self, url, json=None, timeout=None):
         raise self._exc
 
 
@@ -161,6 +162,19 @@ def test_payload_fidelity_example():
 # ---------------------------------------------------------------------------
 
 
+def test_per_request_deadline_scales_with_execution_timeout():
+    """The HTTP deadline must track the sandbox run_timeout, not the session backstop.
+
+    A wedged sandbox should fail one episode after roughly its own execution
+    budget, not hold a rollout worker for the session-level backstop.
+    """
+    client, capture = _client_with(_FakeResp(status=200, payload={"status": "Success"}))
+    asyncio.run(client.run(code="print(1)", files={}, timeout=7))
+    request_timeout = capture["timeout"]
+    assert request_timeout is not None, "post() must carry a per-request timeout"
+    assert request_timeout.total == 7 + 60
+
+
 def test_run_success_status():
     data_in = {"status": "Success", "run_result": {"stdout": "ok"}}
     client, _ = _client_with(_FakeResp(status=200, payload=data_in))
@@ -231,8 +245,9 @@ class _FakeClient:
 
 def test_sandbox_check_correctness_request_shape(monkeypatch):
     fake = _FakeClient((True, {"status": "Success"}))
-    # Patch the module-level singleton so no network/session is created.
-    monkeypatch.setattr(sandbox_mod, "_client", fake)
+    # Patch the accessor so no network/session is created (the cache itself is
+    # per-event-loop internal storage; the function is the injection seam).
+    monkeypatch.setattr(sandbox_mod, "_get_client", lambda: fake)
 
     sample = [{"input": "1", "output": "2", "testtype": "stdin_stdout", "metadata": {}}]
     result = asyncio.run(
@@ -261,10 +276,36 @@ def test_sandbox_check_correctness_request_shape(monkeypatch):
 
 def test_sandbox_check_correctness_propagates_failure(monkeypatch):
     fake = _FakeClient((False, {"error": "HTTP 500: boom"}))
-    monkeypatch.setattr(sandbox_mod, "_client", fake)
+    monkeypatch.setattr(sandbox_mod, "_get_client", lambda: fake)
 
     sample = [{"input": "1", "output": "2", "testtype": "stdin_stdout", "metadata": {}}]
     result = asyncio.run(
         sandbox_mod.sandbox_check_correctness(sample=sample, generation="code")
     )
     assert result == (False, {"error": "HTTP 500: boom"})
+
+
+def test_client_is_fresh_per_event_loop(monkeypatch):
+    """A second asyncio.run() in the same process must not reuse the first
+    loop's client.
+
+    aiohttp sessions are bound to their creation loop; the old process-global
+    singleton made the second run fail with "Event loop is closed". The cache
+    is keyed by the running loop, so each run gets its own client.
+    """
+    import asyncio
+    from training_sessions_cookbook.rl.envs import sandbox as sb
+
+    seen = []
+
+    async def grab():
+        seen.append(sb._get_client())
+
+    asyncio.run(grab())
+    asyncio.run(grab())
+    assert seen[0] is not seen[1], "client leaked across event loops"
+
+    async def grab_twice():
+        return sb._get_client() is sb._get_client()
+
+    assert asyncio.run(grab_twice()), "client not reused within one loop"

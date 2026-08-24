@@ -66,7 +66,6 @@ python -m training_sessions_cookbook.recipes.code_rl.train \
     --role_arn="$ROLE_ARN" \
     --output_s3_path="$OUTPUT_S3_PATH" \
     --no-save_weights_at_end \
-    --no-deploy_and_invoke \
     --env_type=code_rl \
     --template=gpt_oss \
     --lora_rank=32 \

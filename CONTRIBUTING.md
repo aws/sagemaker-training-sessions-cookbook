@@ -14,9 +14,11 @@ pip install -e '.[dev]'
 python -m pytest tests/
 ```
 
-The suite needs no network, credentials, or SDK session, service clients are
-mocked and tokenization is checked on a toy round-trippable tokenizer. Please
-add tests alongside behavior changes.
+The suite needs no credentials or SDK session: service clients are mocked and
+tokenization is checked on a toy round-trippable tokenizer. A handful of
+renderer-fidelity tests compare against real model chat templates and download
+tokenizers from Hugging Face on first run; offline they skip with a clear
+reason rather than fail. Please add tests alongside behavior changes.
 
 ## Code style
 

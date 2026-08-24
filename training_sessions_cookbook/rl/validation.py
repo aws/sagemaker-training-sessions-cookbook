@@ -22,6 +22,7 @@ from .envs.gsm8k import _gsm8k_compute_score, make_gsm8k_observation
 from training_sessions_cookbook.service.console import console_print, console_rule
 
 from .prompts import encode_prompt
+from .config import cfg
 
 
 # === Validation utilities ===
@@ -115,7 +116,7 @@ class ValidationRunner:
         )
 
         # Validation prompts are evaluated concurrently (same rationale as the training rollouts): sample via the sync `sample()` + `asyncio.to_thread` so the event loop stays free and the service batch-fuses the requests, instead of awaiting each prompt serially. Concurrency is bounded by `--num_rollout_workers`. `asyncio.gather` preserves dataset order, which `_check_improvements` and the example printing below rely on.
-        sem = asyncio.Semaphore(getattr(args, "num_rollout_workers", 8))
+        sem = asyncio.Semaphore(cfg(args, "num_rollout_workers"))
 
         async def _evaluate_one(item) -> ValidationExample:
             # A DeepcoderTask (the "true" code-RL val set from --val_code_split)
@@ -139,7 +140,7 @@ class ValidationRunner:
                 expected_answer = item.get("answer", "")
                 # Use the shared GSM8K observation builder so the validation path emits the same instruction text as the training env for the chosen `--answer_format`. Without this, val and train would silently diverge when `--answer_format` changes (and val/accuracy would no longer be comparable to rollout/reward_mean).
                 observation = make_gsm8k_observation(
-                    prompt_text, getattr(args, "answer_format", "hash")
+                    prompt_text, cfg(args, "answer_format")
                 )
 
             templated_prompt = template_fn(observation)
@@ -185,7 +186,7 @@ class ValidationRunner:
                     response_text,
                     expected_answer,
                     format_score=0.0,
-                    answer_format=getattr(args, "answer_format", "hash"),
+                    answer_format=cfg(args, "answer_format"),
                 )
 
             return ValidationExample(
@@ -285,7 +286,7 @@ class ValidationRunner:
         if code is not None:
             try:
                 passed, _ = await sandbox_check_correctness(
-                    task.tests, code, getattr(args, "code_timeout", 6)
+                    task.tests, code, cfg(args, "code_timeout")
                 )
             except Exception as exc:  # grading failure -> treat as not solved
                 logging.getLogger(__name__).warning(
@@ -296,7 +297,7 @@ class ValidationRunner:
                 passed = False
 
         reward, _ = deepcoder_reward(
-            response, bool(passed), getattr(args, "format_coef", 0.1)
+            response, bool(passed), cfg(args, "format_coef")
         )
         return float(reward)
 
@@ -305,7 +306,7 @@ class ValidationRunner:
         if not response or not test_code:
             return 0.0
         full_code = response + "\n" + test_code
-        timeout = getattr(args, "code_timeout", 10)
+        timeout = cfg(args, "code_timeout")
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
                 script_path = os.path.join(tmpdir, "solution.py")
@@ -322,5 +323,12 @@ class ValidationRunner:
         except subprocess.TimeoutExpired:
             return 0.0
         except Exception:
+            # Grading must never crash validation, but a harness error (bad
+            # tmpdir, interpreter missing) must not silently masquerade as
+            # "the model got it wrong" - log it so a systematic failure is
+            # visible instead of appearing as a uniformly-zero val score.
+            logging.getLogger(__name__).warning(
+                "validation: toy-code grader errored; scoring 0.0", exc_info=True
+            )
             return 0.0
 

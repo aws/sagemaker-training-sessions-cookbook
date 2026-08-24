@@ -36,7 +36,7 @@ def _cache_dir() -> str:
     )
 
 
-def _cache_path(split: str, seed: int, max_prompts: int | None) -> str:
+def _cache_path(split: str, seed: int, max_prompts: int | None, task_offset: int = 0) -> str:
     """Cache file path keyed by everything that changes the built task list.
 
     The key folds in the split, seed, cap, the ``DEEPCODER_SPLITS`` override
@@ -47,6 +47,7 @@ def _cache_path(split: str, seed: int, max_prompts: int | None) -> str:
         "split": split,
         "seed": seed,
         "max_prompts": max_prompts,
+        "task_offset": task_offset,
         "splits_env": os.getenv("DEEPCODER_SPLITS", "").strip(),
         "version": _CACHE_VERSION,
     }
@@ -157,6 +158,7 @@ def load_deepcoder_tasks(
     split: Literal["train", "test"] = "train",
     seed: int = 0,
     max_prompts: int | None = None,
+    task_offset: int = 0,
 ) -> list[DeepcoderTask]:
     """Load tasks from the DeepCoder dataset.
 
@@ -164,6 +166,10 @@ def load_deepcoder_tasks(
         split: Which split to load ("train" or "test").
         seed: Random seed for shuffling (train split only).
         max_prompts: Optional cap on the number of tasks returned.
+        task_offset: Skip this many tasks of the seeded shuffle before taking
+            ``max_prompts``. Windows ``[offset, offset+max_prompts)`` over the
+            same seed are strictly disjoint; used by load tests so concurrent
+            sessions on one engine never share prompts (KV-cache isolation).
 
     Returns:
         List of DeepcoderTask instances with normalized test cases.
@@ -188,7 +194,7 @@ def load_deepcoder_tasks(
           processing loop, so repeat runs prep in well under a second. Disable
           with ``DEEPCODER_NO_CACHE=1``; relocate with ``DEEPCODER_CACHE_DIR``.
     """
-    cache_path = _cache_path(split, seed, max_prompts)
+    cache_path = _cache_path(split, seed, max_prompts, task_offset)
     if _cache_enabled() and os.path.exists(cache_path):
         t_cache = time.perf_counter()
         try:
@@ -215,12 +221,14 @@ def load_deepcoder_tasks(
     n = len(ds)
     # Decide which rows to read, and in what order, without random access over
     # the full corpus (see "Performance notes" above).
-    if max_prompts is not None and max_prompts < n:
+    if max_prompts is not None and (task_offset + max_prompts) < n:
         indices = list(range(n))
         random.Random(seed).shuffle(indices)
         # Read the chosen subset in ascending file order for I/O locality; the
         # training order is randomized below by shuffling the built list.
-        indices = sorted(indices[:max_prompts])
+        # task_offset windows into the seeded shuffle: same seed, different
+        # offsets -> strictly disjoint task subsets.
+        indices = sorted(indices[task_offset : task_offset + max_prompts])
         source = ds.select(indices)
     else:
         source = ds

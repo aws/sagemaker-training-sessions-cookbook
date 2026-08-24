@@ -7,6 +7,8 @@ turns a template result (string or pre-tokenized ids) into token ids.
 
 from __future__ import annotations
 
+from typing import Optional
+
 
 
 # === Prompt templates ===
@@ -14,7 +16,19 @@ from __future__ import annotations
 # Each template is a function `apply_X(observation: str) -> str` that wraps the observation in the model family's chat format. `apply_auto` selects a template by substring match against `args.base_model` and falls back to `qwen3_general`. `TEMPLATE_FACTORY` is the dispatch dict keyed by the seven `--template` values exposed on the CLI.
 
 
-def apply_qwen3_general(question: str) -> str:
+def apply_qwen3_general(question: str, tools: "Optional[list[dict]]" = None) -> str:
+    if tools:
+        from .envs.tool_render import render_tool_schema
+
+        # The declarations are a complete system turn and must precede the user
+        # turn, matching Qwen's own chat template. Concatenating them into the
+        # question would nest a system turn inside the user message.
+        schema_frame = render_tool_schema(tools, "qwen3")
+        return (
+            f"{schema_frame}\n"
+            f"<|im_start|>user\n{question}<|im_end|>\n"
+            "<|im_start|>assistant\n"
+        )
     return f"<|im_start|>user\n{question}<|im_end|>\n" "<|im_start|>assistant\n"
 
 
@@ -26,7 +40,7 @@ def apply_qwen3_game(observation: str) -> str:
     )
 
 
-def apply_gpt_oss(question: str, reasoning: str = "high") -> str:
+def apply_gpt_oss(question: str, reasoning: str = "high", tools: "Optional[list[dict]]" = None) -> str:
     """Hand-rolled gpt-oss chat prompt with configurable reasoning level.
 
     `reasoning` is mapped directly into the `Reasoning: <level>` system-block field. `auto` resolves to `high`. `off` resolves to `low` so the model still produces a (minimal) analysis channel; the gpt-oss chat format does not have a zero-reasoning mode. Compare to `apply_hf(..., reasoning=...)` which uses the model-shipped jinja and adds the ChatGPT identity + date framing on top.
@@ -35,12 +49,31 @@ def apply_gpt_oss(question: str, reasoning: str = "high") -> str:
         reasoning = "high"
     elif reasoning == "off":
         reasoning = "low"
+    schema_frame = ""
+    tools_channel_line = ""
+    if tools:
+        from .envs.tool_render import render_tool_schema
+
+        # A complete developer-role frame, placed between the system and user
+        # frames as gpt-oss's own chat template does. Concatenating it into the
+        # question instead would nest the declarations inside the user message.
+        schema_frame = render_tool_schema(tools, "gpt_oss")
+        # The harmony spec requires this exact line in the SYSTEM message when
+        # functions are defined (the model's own template emits it right after
+        # the channels line); it is what routes tool calls to the commentary
+        # channel rather than leaking them into analysis/final.
+        tools_channel_line = (
+            "\nCalls to these tools must go to the commentary channel: 'functions'."
+        )
     return (
         "<|start|>system<|message|>You are a helpful assistant.\n"
         f"Reasoning: {reasoning}\n"
         "# Valid channels: analysis, commentary, final. "
-        "Channel must be included for every message.<|end|>"
-        f"<|start|>user<|message|>{question}<|end|>"
+        "Channel must be included for every message."
+        + tools_channel_line
+        + "<|end|>"
+        + schema_frame
+        + f"<|start|>user<|message|>{question}<|end|>"
         "<|start|>assistant"
     )
 
@@ -71,11 +104,16 @@ def _apply_chat_template_progressive(tokenizer, messages, extra_kwargs: dict) ->
     We try the full `extra_kwargs` first, then progressively drop pieces until something works. First success wins; behavior is identical for templates that accept everything we pass.
     """
     base = dict(tokenize=True, add_generation_prompt=True, return_tensors=None)
+    # `tools` is part of `apply_chat_template`'s own signature (not a template
+    # kwarg), so it can never be the cause of a TypeError - and dropping it in a
+    # fallback would silently render a tool-less prompt, which is a training
+    # corruption, not a degradation. Preserve it across every attempt.
+    keep = {k: v for k, v in extra_kwargs.items() if k == "tools"}
     attempts = [
         extra_kwargs,
-        {k: v for k, v in extra_kwargs.items() if k == "enable_thinking"},
-        {k: v for k, v in extra_kwargs.items() if k == "reasoning_effort"},
-        {},
+        {**keep, **{k: v for k, v in extra_kwargs.items() if k == "enable_thinking"}},
+        {**keep, **{k: v for k, v in extra_kwargs.items() if k == "reasoning_effort"}},
+        keep,
     ]
     last_exc: Exception = RuntimeError("apply_chat_template never attempted")
     for kw in attempts:
@@ -104,35 +142,48 @@ def _reasoning_to_kwargs(reasoning: str) -> dict:
     return {"enable_thinking": True}
 
 
-def apply_gemma(observation: str, tokenizer, reasoning: str = "auto") -> list[int]:
+def apply_gemma(observation: str, tokenizer, reasoning: str = "auto", tools: "Optional[list[dict]]" = None) -> list[int]:
     """Tokenize a Gemma user-turn prompt using the model-shipped chat template.
 
-    Returns a list of token IDs (NOT a string) because Gemma's tokenizer ships role markers like `<|turn>` / `<turn|>` present in the vocab but not registered as no-split special tokens; the standard `tokenizer.encode("<|turn>...")` path splits them into character tokens and corrupts every prompt. Routing through `apply_chat_template(..., tokenize=True)` uses Gemma's own chat template and emits the correct special-token IDs.
+    Returns a list of token IDs (NOT a string), produced by `apply_chat_template(..., tokenize=True)` so the prompt is exactly what Gemma's own template emits - including special-token handling and any template-version changes - with no re-encode step to drift. (Verified against the current tokenizer: `encode` on the rendered string happens to round-trip byte-identically, so this is defence-in-depth rather than a correctness requirement; earlier revisions of this docstring claimed encode corrupted the markers, which measurement does not support.)
 
     `reasoning` maps to Gemma's `enable_thinking` kwarg via `_reasoning_to_kwargs`: `off` → `enable_thinking=False` (the empty `<|channel>thought\\n<channel|>` skip-marker is emitted, telling the model to go straight to content); `low|medium|high` → `enable_thinking=True` (the system block opens with `<|think|>\\n` and the skip-marker is suppressed so the model can use its thinking channel). `auto` keeps whatever the chat template's own default is (typically thinking off, but we override that elsewhere via the --reasoning flag for math runs).
     """
+    kwargs = _reasoning_to_kwargs(reasoning)
+    if tools:
+        # Gemma's own jinja accepts `tools=` and renders the declarations into
+        # the system turn itself - the one family where we can delegate the
+        # whole first prompt to the model's template.
+        kwargs = dict(kwargs, tools=[{"type": "function", "function": t} for t in tools])
     return _apply_chat_template_progressive(
         tokenizer,
         [{"role": "user", "content": observation}],
-        _reasoning_to_kwargs(reasoning),
+        kwargs,
     )
 
 
-def apply_hf(observation: str, tokenizer, reasoning: str = "auto") -> list[int]:
+def apply_hf(observation: str, tokenizer, reasoning: str = "auto", tools: "Optional[list[dict]]" = None) -> list[int]:
     """Generic HF chat-template wrapper for any model family.
 
     Drives `tokenizer.apply_chat_template` with the model's own jinja, threading the `--reasoning` knob through whatever kwargs the template happens to accept (`enable_thinking` for gemma-style, `reasoning_effort` for gpt-oss-style, neither for plain qwen/llama). Unknown kwargs are silently dropped by `_apply_chat_template_progressive` so this works on any tokenizer.
 
     Use this template by passing `--template hf` to opt into the model's canonical prompt format (including any identity / date framing the model card encodes in its jinja). Compare to the hand-rolled `apply_qwen3_general` / `apply_gpt_oss` paths which use a stripped-down format the cookbook authors wrote by hand.
     """
+    kwargs = _reasoning_to_kwargs(reasoning)
+    if tools:
+        # `tools` is a first-class `apply_chat_template` argument; the model's
+        # own jinja places the declarations (gpt-oss: developer message; gemma:
+        # system turn). `_apply_chat_template_progressive` preserves it across
+        # its fallback attempts precisely so it can never be silently dropped.
+        kwargs = dict(kwargs, tools=[{"type": "function", "function": t} for t in tools])
     return _apply_chat_template_progressive(
         tokenizer,
         [{"role": "user", "content": observation}],
-        _reasoning_to_kwargs(reasoning),
+        kwargs,
     )
 
 
-def apply_auto(observation: str, base_model: str, tokenizer=None, reasoning: str = "auto"):
+def apply_auto(observation: str, base_model: str, tokenizer=None, reasoning: str = "auto", tools: "Optional[list[dict]]" = None):
     """Pick a template by substring match against `base_model`.
 
     Match precedence (first hit wins):
@@ -151,12 +202,12 @@ def apply_auto(observation: str, base_model: str, tokenizer=None, reasoning: str
     """
     name = (base_model or "").rstrip("/").split("/")[-1].lower()
     if "gpt-oss" in name:
-        return apply_gpt_oss(observation, reasoning=reasoning)
+        return apply_gpt_oss(observation, reasoning=reasoning, tools=tools)
     if "gemma" in name:
-        return apply_gemma(observation, tokenizer, reasoning=reasoning)
+        return apply_gemma(observation, tokenizer, reasoning=reasoning, tools=tools)
     if "qwen" in name:
-        return apply_qwen3_general(observation)
-    return apply_qwen3_general(observation)
+        return apply_qwen3_general(observation, tools=tools)
+    return apply_qwen3_general(observation, tools=tools)
 
 
 def encode_prompt(result, tokenizer) -> list[int]:

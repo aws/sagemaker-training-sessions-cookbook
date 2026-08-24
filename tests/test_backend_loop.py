@@ -17,6 +17,8 @@ import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+from training_sessions_cookbook.rl.runstate import attach_run_artifacts, run_artifacts
+
 # The driver imports `from backends import make_backend` at module load. That package import is SDK-free (sagemaker is imported lazily inside the backend's create()), so we import the driver directly.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -117,10 +119,6 @@ class MockBackend:
         return _FbResult({"loss": 0.5, "grad_norm": 0.01})
 
     # checkpoint / deploy
-    def deploy_and_invoke(self):
-        self.deployed = True
-        return {"endpoint": "mock", "generations": ["#### 42"]}
-
     def close(self):
         self.closed = True
 
@@ -166,8 +164,14 @@ def _args(tmp_path, **overrides):
     )
     base.update(overrides)
     ns = SimpleNamespace(**base)
-    ns._run_folder = str(tmp_path)
-    ns._metrics_path = os.path.join(str(tmp_path), "metrics.jsonl")
+    # Run-scoped artifacts travel via the typed accessor, not raw private
+    # attributes (rl.runstate owns that contract).
+    attach_run_artifacts(
+        ns,
+        run_folder=str(tmp_path),
+        metrics_path=os.path.join(str(tmp_path), "metrics.jsonl"),
+        mlflow=None,
+    )
     return ns
 
 
@@ -198,7 +202,7 @@ def test_loop_writes_expected_metrics_schema(tmp_path):
     backend = MockBackend()
     _run(args, backend)
 
-    metrics_path = args._metrics_path
+    metrics_path = run_artifacts(args).metrics_path
     assert os.path.exists(metrics_path)
     with open(metrics_path) as f:
         records = [json.loads(line) for line in f if line.strip()]
@@ -225,7 +229,7 @@ def test_loop_reward_is_one_when_answer_matches(tmp_path):
     backend = MockBackend(answer_text="#### 42")
     _run(args, backend)
 
-    with open(args._metrics_path) as f:
+    with open(run_artifacts(args).metrics_path) as f:
         records = [json.loads(line) for line in f if line.strip()]
     assert records, "no metrics written"
     # The mock always emits the correct answer, so every episode scores 1.0.

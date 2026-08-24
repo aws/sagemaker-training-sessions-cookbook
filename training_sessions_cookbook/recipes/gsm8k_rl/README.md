@@ -1,7 +1,7 @@
 # GSM8K RL
 
 Policy-gradient RL on grade-school math: sample rollouts from the current
-policy, reward the final boxed answer, compute grouped (GRPO-style) or
+policy, reward the final `#### <answer>` line, compute grouped (GRPO-style) or
 Monte-Carlo advantages, and train with `--loss ppo`, `importance_sampling`,
 or `cispo`. A built-in 20-problem subset makes smoke runs dataset-free; use
 `tools/download_gsm8k.py` for the full dataset.
@@ -45,15 +45,18 @@ recipe:
 - **Overlapped training (off-by-k)**: `--max_steps_off_policy K` lets rollout
   workers keep generating while the trainer trains; stale groups are dropped
   or requeued per `--stale_policy` (`rl/staleness.py`).
-- **Validation**: `--val_dataset_path` scores greedy completions on a
-  held-out set on a cadence (`rl/validation.py`).
+- **Validation**: `--val_dataset_path` scores sampled completions (at the
+  training temperature) on a held-out set on a cadence (`rl/validation.py`).
 
 ## Checkpoints
 
 Every saved checkpoint is a SageMaker model package, recorded in
-`{run_folder}/checkpoints.jsonl`. By default the run saves once at the end
-(`save_state`: weights + optimizer, resumable); `--save_every N` adds full
-periodic checkpoints mid-run, and `--save_weights_at_end` additionally
+`{run_folder}/checkpoints.jsonl`. By default the run saves a full checkpoint
+at the end (`save_state`: weights + optimizer, resumable) plus a rolling
+crash-recovery checkpoint every 10 steps (state-only, saved in the background;
+each one deletes its predecessor so storage stays bounded -
+`--rolling_save_every` tunes the cadence, `0` disables). `--save_every N` adds
+full periodic checkpoints mid-run, and `--save_weights_at_end` additionally
 publishes a deployable adapter package.
 
 ## Bring your own environment

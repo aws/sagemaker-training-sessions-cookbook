@@ -28,6 +28,7 @@ import pytest  # noqa: E402
 
 from training_sessions_cookbook.rl import train as rl  # noqa: E402
 from tests.test_backend_loop import MockBackend, _args  # noqa: E402
+from training_sessions_cookbook.rl.runstate import run_artifacts  # noqa: E402
 
 
 # --- Helpers --------------------------------------------------------------
@@ -172,7 +173,7 @@ def test_async_loop_exhausts_dataset_and_trains_expected_batches(tmp_path):
     backend = MockBackend()
     _run_async_with_task_guard(args, backend, _gsm8k_dataset(8))
 
-    with open(args._metrics_path) as f:
+    with open(run_artifacts(args).metrics_path) as f:
         records = [json.loads(line) for line in f if line.strip()]
     step_records = [r for r in records if "train/loss" in r]
     assert len(step_records) == 4, [r["step"] for r in step_records]
@@ -193,7 +194,7 @@ def test_async_loop_writes_staleness_and_core_metrics(tmp_path):
     backend = MockBackend()
     _run_async_with_task_guard(args, backend, _gsm8k_dataset(8))
 
-    with open(args._metrics_path) as f:
+    with open(run_artifacts(args).metrics_path) as f:
         records = [json.loads(line) for line in f if line.strip()]
     assert records
     r = records[0]
@@ -218,7 +219,7 @@ def test_async_loop_reward_is_one_when_answer_matches(tmp_path):
     args = _async_args(tmp_path, max_steps=10, batch_size=2)
     backend = MockBackend(answer_text="#### 42")
     _run_async_with_task_guard(args, backend, _gsm8k_dataset(8))
-    with open(args._metrics_path) as f:
+    with open(run_artifacts(args).metrics_path) as f:
         records = [json.loads(line) for line in f if line.strip()]
     assert records
     assert all(rec["rollout/reward_mean"] == 1.0 for rec in records)

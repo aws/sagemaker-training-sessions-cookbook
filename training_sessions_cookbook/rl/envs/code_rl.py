@@ -7,7 +7,7 @@ Single-turn core:
   - ``CodeRLEnv``: LCB prompt -> sample -> extract -> grade -> done, with grading on an async path because the SandboxFusion client is async.
 
 Multi-turn agent-tool loop:
-  - the initial observation is the LCB prompt plus the ``check_solution`` tool schema (rendered by ``envs.tool_render.render_tool_schema``);
+  - the initial observation is the LCB prompt; the ``check_solution`` tool spec travels as data in ``info["tools"]`` so the prompt template can place the declarations where each model family expects them;
   - each turn parses the assistant text for tool calls; a ``check_solution`` call grades the submitted code in the sandbox and feeds the result back as a tool-result message for the next turn;
   - the episode ends when the model emits no tool call (a final answer), a tool signals stop, ``max_turns`` is reached, the output fails to parse (``failed_parse_reward``), or the trajectory would overflow the context window (``context_overflow_reward``);
   - the terminal reward is graded ONCE from the final assistant message via ``deepcoder_reward``.
@@ -32,8 +32,11 @@ from .base import Message, ToolCall  # ToolCall re-exported for callers
 from .deepcoder import DeepcoderTask, load_deepcoder_tasks
 from .lcb_utils import extract_code_from_model
 from .sandbox import sandbox_check_correctness
+from ..config import cfg
+from ..runstate import set_shared_dataset
 from .tool_render import (
     check_solution_tool_spec,
+    SUPPORTED_FAMILIES,
     family_for_model,
     parse_tool_calls,
     render_tool_call, # re-exported for symmetry / tests
@@ -122,6 +125,27 @@ class CodeRLEnv:
         self.rng = random.Random(seed)
 
         self.family = family_for_model(model_name) if model_name else family
+        if self.max_turns > 1 and self.family not in SUPPORTED_FAMILIES:
+            # Fail at construction, not mid-episode: the renderer is first
+            # exercised minutes into sampling, and an unsupported family does
+            # not raise there - it silently emits tool syntax the model was
+            # never trained on, which reads as a weak model rather than a
+            # misconfiguration.
+            if self.family is None:
+                raise ValueError(
+                    f"multi-turn Code RL (max_turns={self.max_turns}) needs a tool "
+                    f"renderer, but model {model_name!r} matches no known family. "
+                    f"Implemented families: {', '.join(SUPPORTED_FAMILIES)} "
+                    "(envs/tool_render.py, FAMILY table). Either add the model to "
+                    "that table with a renderer, pass family= explicitly, or run "
+                    "single-turn with --max_turns 1."
+                )
+            raise ValueError(
+                f"multi-turn Code RL (max_turns={self.max_turns}) needs a tool "
+                f"renderer for family {self.family!r}, but only "
+                f"{', '.join(SUPPORTED_FAMILIES)} are implemented "
+                "(envs/tool_render.py). Use --max_turns 1 or a supported model."
+            )
         self.failed_parse_reward = failed_parse_reward
         self.context_overflow_reward = context_overflow_reward
         self.max_trajectory_tokens = max_trajectory_tokens
@@ -177,7 +201,7 @@ class CodeRLEnv:
 
         Returns ``(observation, info)`` with ``info["env_type"] == "code_rl"``.
 
-        For the single-turn case (``max_turns == 1``) the observation is the rendered LCB prompt for the task. For the multi-turn case (``max_turns > 1``) the observation is the LCB prompt followed by the ``check_solution`` tool schema (rendered via ``render_tool_schema``) so the model can see the tool, and the conversation history / approximate trajectory token count are initialized from it.
+        For the single-turn case (``max_turns == 1``) the observation is the rendered LCB prompt for the task. For the multi-turn case (``max_turns > 1``) the observation is the bare LCB prompt and ``info["tools"]`` carries the ``check_solution`` tool spec; the template layer renders the declarations into their own chat frame (embedding the rendered schema in the observation - the previous behaviour - nested a complete system/developer turn inside the user message). The trajectory token budget still accounts for the schema's prompt tokens.
         """
         if seed is not None:
             self.rng = random.Random(seed)
@@ -189,11 +213,23 @@ class CodeRLEnv:
         if self.max_turns <= 1:
             return self.task.problem, {"env_type": "code_rl"}
 
-        schema = render_tool_schema([check_solution_tool_spec()], self.family)
-        observation = f"{self.task.problem}\n\n{schema}"
+        # The tool schema travels as DATA (``info["tools"]``), not as text baked
+        # into the observation. The template layer owns chat framing: each
+        # ``apply_*`` template places the declarations where that model's own
+        # chat template puts them (gpt-oss: developer frame after system; qwen3:
+        # system turn before user; gemma: rendered by the model's own jinja via
+        # ``tools=``). Concatenating the rendered schema frame into the
+        # observation - the previous behaviour - nested a complete system/
+        # developer turn inside the user message, so every episode started
+        # malformed for the model.
+        tools = [check_solution_tool_spec()]
+        observation = self.task.problem
         self._history.append(Message(role="user", content=observation))
-        self._traj_tokens = self._count(observation)
-        return observation, {"env_type": "code_rl"}
+        # Account for the schema in the context budget even though it is no
+        # longer part of the observation string: it still occupies prompt tokens.
+        schema = render_tool_schema(tools, self.family)
+        self._traj_tokens = self._count(observation) + self._count(schema)
+        return observation, {"env_type": "code_rl", "tools": tools}
 
     # --- token accounting / context-overflow guard -------------------------
 
@@ -301,10 +337,19 @@ class CodeRLEnv:
             else:
                 passed, details = False, {"error": f"unknown tool: {tc.name}"}
 
-            result_content = json.dumps(
-                {"passed": bool(passed), "details": details},
-                ensure_ascii=False,
-            )
+            result_payload: dict = {"passed": bool(passed), "details": details}
+            # Only the first call is executed (one sandbox run per turn keeps
+            # grading and token accounting per-turn); TELL the model the rest
+            # were ignored instead of dropping them silently - observed live
+            # (gpt-oss emitted two calls in one turn) and without this notice
+            # the model cannot learn the one-call-per-turn contract.
+            if len(tool_calls) > 1:
+                result_payload["notice"] = (
+                    f"only the first tool call was executed; {len(tool_calls) - 1} "
+                    "additional call(s) in this turn were ignored - make one "
+                    "call per turn"
+                )
+            result_content = json.dumps(result_payload, ensure_ascii=False)
             self._history.append(Message(role="tool", content=result_content))
             next_obs = render_tool_result("check_solution", result_content, self.family)
             self._traj_tokens += self._count(next_obs)
@@ -366,7 +411,7 @@ def build_code_rl_env_factory(args: Any) -> Callable[[], "CodeRLEnv"]:
     This is the registry entry point for ``--env_type code_rl``. It mirrors the GSM8K factory contract: a *zero-arg* callable producing a fresh ``CodeRLEnv`` per concurrent rollout (envs are stateful). Two extra effects make it drop into the existing training loop unchanged:
 
     1. **Load DeepCoder tasks once** via :func:`envs.deepcoder.load_deepcoder_tasks` (lazy ``datasets`` import happens there). The same task list is shared by every env instance the factory produces.
-    2. **Publish the tasks to ``args._dataset``** so the training loop's central sampler iterates DeepCoder tasks (popping one and handing it to each env via ``assign_problem``) exactly as it iterates GSM8K dicts. ``main()`` reads ``args._dataset`` back after building the factory so ``next_batch`` / ``run_training`` see DeepCoder tasks rather than the GSM8K dataset.
+    2. **Publish the tasks via ``runstate.set_shared_dataset``** so the training loop's central sampler iterates DeepCoder tasks (popping one and handing it to each env via ``assign_problem``) exactly as it iterates GSM8K dicts. ``main()`` reads the shared dataset back after building the factory so ``next_batch`` / ``run_training`` see DeepCoder tasks rather than the GSM8K dataset.
 
     All Code-RL-specific knobs (``--format_coef`` / ``--context_overflow_reward`` / ``--max_trajectory_tokens``) are read defensively with ``getattr`` so absent ones fall back to the documented defaults. This function does NOT register new CLI args.
 
@@ -378,20 +423,21 @@ def build_code_rl_env_factory(args: Any) -> Callable[[], "CodeRLEnv"]:
     """
     tasks = load_deepcoder_tasks(
         "train",
-        seed=getattr(args, "seed", 0),
-        max_prompts=getattr(args, "max_prompts", None),
+        seed=cfg(args, "seed"),
+        max_prompts=cfg(args, "max_prompts"),
+        task_offset=cfg(args, "task_offset"),
     )
 
     # Publish to the central sampler's dataset slot so next_batch iterates the DeepCoder tasks (the sampler pops a task and assigns it to each env, exactly like GSM8K dicts).
-    args._dataset = tasks
+    set_shared_dataset(args, tasks)
 
     return lambda: CodeRLEnv(
         dataset=tasks,
-        timeout=getattr(args, "code_timeout", 6),
-        format_coef=getattr(args, "format_coef", 0.1),
+        timeout=cfg(args, "code_timeout"),
+        format_coef=cfg(args, "format_coef"),
         max_turns=args.max_turns,
         model_name=args.base_model,
-        max_trajectory_tokens=getattr(args, "max_trajectory_tokens", 32768),
-        max_generation_tokens=getattr(args, "max_tokens", None),
-        context_overflow_reward=getattr(args, "context_overflow_reward", -0.1),
+        max_trajectory_tokens=cfg(args, "max_trajectory_tokens"),
+        max_generation_tokens=cfg(args, "max_tokens"),
+        context_overflow_reward=cfg(args, "context_overflow_reward"),
     )

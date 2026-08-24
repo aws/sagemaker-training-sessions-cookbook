@@ -15,6 +15,8 @@ from typing import Optional
 
 from .backends import TrainingBackend
 from .prompts import encode_prompt
+from .envs.tool_render import generation_opener
+from .config import cfg
 
 
 # === GSM8K env + builtin dataset ===
@@ -220,7 +222,7 @@ async def rollout_one_code(
     Args:
         prompt: A `DeepcoderTask` (or dict/tuple accepted by `env.assign_problem`).
         env: A fresh `CodeRLEnv` (one per concurrent rollout; stateful).
-        template_fn: Unary `(observation: str) -> str` template; for code_rl the observation already carries the LCB prompt (+ tool schema in multi-turn) and the gpt-oss template wraps it.
+        template_fn: Unary `(observation: str) -> str` template, applied ONLY to the first observation (the LCB prompt plus, in multi-turn, the tool schema). Later turns are already chat-framed by the tool renderer and are appended unwrapped.
         sampling_client: The live `SamplingClient` for this step.
         sampling_params: Pre-built `SamplingParams`.
         max_turns: Hard cap on conversation turns; the env may end earlier.
@@ -246,7 +248,19 @@ async def rollout_one_code(
     env_type = info.get("env_type", "code_rl")
 
     # Running templated conversation, accumulated as token IDs (NOT a string) for the same reasons as `rollout_one`: see comments there.
-    running_tokens: list[int] = encode_prompt(template_fn(observation), tokenizer)
+    #
+    # When the env advertises tools (multi-turn), they are passed to the
+    # template as data so each family's template can place the declarations
+    # where its model expects them (gpt-oss: developer frame; qwen3: system
+    # turn; gemma: the model's own jinja via `tools=`). A template bound
+    # without tools support falls back to the plain path.
+    # No fallback here on purpose: a template that cannot take `tools` must
+    # fail loudly rather than silently render a tool-less prompt (the model
+    # would then be trained/evaluated on episodes where it cannot see the tool
+    # it is graded on using).
+    tools = info.get("tools")
+    first = template_fn(observation, tools=tools) if tools else template_fn(observation)
+    running_tokens: list[int] = encode_prompt(first, tokenizer)
 
     transitions: list[Transition] = []
     for _turn in range(max_turns):
@@ -293,9 +307,30 @@ async def rollout_one_code(
         if done:
             break
 
-        # Append assistant action tokens + the templated next observation (for code_rl the rendered tool result is wrapped via template_fn). `encode_prompt` normalizes whichever return shape the template produces (str → encode, list[int] → pass-through).
-        running_tokens = running_tokens + act_tokens + encode_prompt(
-            template_fn(next_obs), tokenizer
+        # Append the sampled assistant action tokens + the tool result.
+        #
+        # `next_obs` from CodeRLEnv is ALREADY a complete chat frame produced by
+        # `envs.tool_render.render_tool_result` (e.g. for harmony:
+        # `<|start|>functions.NAME to=assistant<|channel|>commentary<|message|>...<|end|>`).
+        # It must not pass through `template_fn`: that would open a second
+        # system block and nest the tool frame inside a fresh user message, so
+        # every turn from the second onward would be malformed for the model.
+        # This mirrors `rollout_one`, which likewise encodes its next
+        # observation directly. Note the sampled `act_tokens` are appended
+        # verbatim rather than re-encoded from text, because the training datums
+        # and their logprobs refer to exactly those token ids.
+        # After the tool result, open a fresh reply frame the way each model's
+        # own template does with `add_generation_prompt=True` after a tool
+        # message (gpt-oss: `<|start|>assistant`; qwen3: `<|im_start|>assistant`;
+        # gemma: nothing - it continues the same model turn). Without it the
+        # model is asked to continue right after the result's end token, a
+        # position it never generated from in training.
+        opener = generation_opener(getattr(env, "family", "gpt_oss"))
+        running_tokens = (
+            running_tokens
+            + act_tokens
+            + encode_prompt(next_obs, tokenizer)
+            + (encode_prompt(opener, tokenizer) if opener else [])
         )
 
     return transitions
@@ -323,7 +358,7 @@ async def collect_batch_async(
 
     rollout_fn = (
         rollout_one_code
-        if getattr(args, "env_type", "gsm8k") == "code_rl"
+        if cfg(args, "env_type") == "code_rl"
         else rollout_one
     )
 
@@ -367,7 +402,7 @@ async def collect_grouped_batch_async(
 
     rollout_fn = (
         rollout_one_code
-        if getattr(args, "env_type", "gsm8k") == "code_rl"
+        if cfg(args, "env_type") == "code_rl"
         else rollout_one
     )
 
@@ -422,7 +457,7 @@ async def collect_one_group_async(
     """
     rollout_fn = (
         rollout_one_code
-        if getattr(args, "env_type", "gsm8k") == "code_rl"
+        if cfg(args, "env_type") == "code_rl"
         else rollout_one
     )
     shared_params = backend.make_sampling_params(

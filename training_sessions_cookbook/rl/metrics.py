@@ -14,6 +14,8 @@ from typing import Optional
 
 from training_sessions_cookbook.service import append_metrics
 from training_sessions_cookbook.service.console import console_print, format_metric_values, print_kv_table
+from .config import cfg
+from .runstate import run_artifacts
 
 
 # === Metrics aggregation and logging ===
@@ -186,15 +188,15 @@ def capture_rollouts(args, step: int, episodes: list, tokenizer, metrics_path: s
     * ``--mlflow_log_rollouts N``: publish the first N episodes of this step
       as MLflow traces (visible live in the experiment's Traces view).
     """
-    if getattr(args, "record_trajectories", False):
+    if cfg(args, "record_trajectories"):
         traj_path = os.path.join(
-            getattr(args, "_run_folder", None) or os.path.dirname(metrics_path),
+            run_artifacts(args).run_folder or os.path.dirname(metrics_path),
             "trajectories.jsonl",
         )
         record_trajectories(traj_path, step, episodes, tokenizer)
 
-    n_traces = int(getattr(args, "mlflow_log_rollouts", 0) or 0)
-    publisher = getattr(args, "_mlflow", None)
+    n_traces = int(cfg(args, "mlflow_log_rollouts") or 0)
+    publisher = run_artifacts(args).mlflow
     if n_traces != 0 and publisher is not None:
         publisher.log_rollout_traces(
             step, episodes_to_rollout_dicts(episodes, tokenizer, n_traces)

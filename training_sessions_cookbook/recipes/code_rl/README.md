@@ -35,6 +35,8 @@ refresh, off-by-k, validation). This recipe adds:
 
 - **Sandboxed grading**: `rl/envs/code_rl.py` submits generated code to a
   SandboxFusion container and scores unit-test pass rate.
-- **Multi-turn tool rendering**: `rl/envs/tool_render.py` formats execution
-  feedback for follow-up turns.
+- **Multi-turn tool rendering**: `rl/envs/tool_render.py` renders tool
+  declarations, calls, and execution feedback in each model family's native
+  chat format (gpt-oss/harmony, qwen3, gemma), verified token-for-token
+  against the models' own chat templates.
 - **DeepCoder dataset**: `rl/envs/deepcoder.py` loads and filters the corpus.

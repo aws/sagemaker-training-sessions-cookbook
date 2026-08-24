@@ -123,9 +123,17 @@ def test_render_tool_result_contains_name_and_content():
 
 
 def test_family_for_model_dispatch():
-    """gpt-oss model names and None both resolve to the gpt_oss family."""
+    """Known names resolve to their family; unknown names resolve to None.
+
+    ``None`` rather than a default family is deliberate: handing an
+    unrecognised model gpt-oss tool syntax produces a silently mis-trained run
+    instead of an error (see envs/tool_render.family_for_model).
+    """
     assert family_for_model("openai/gpt-oss-20b") == "gpt_oss"
-    assert family_for_model(None) == "gpt_oss"
+    assert family_for_model("Qwen/Qwen3.6-27B") == "qwen3"
+    assert family_for_model("google/gemma-4-31B-it") == "gemma"
+    assert family_for_model(None) is None
+    assert family_for_model("mistralai/Mistral-7B-Instruct-v0.3") is None
 
 
 def test_harmony_token_in_argument_round_trips():
@@ -141,3 +149,97 @@ def test_harmony_token_in_argument_round_trips():
     combo = "".join(_HARMONY_TOKENS)
     rendered = render_tool_call("check_solution", {"code": combo})
     assert parse_tool_calls(rendered) == [ToolCall("check_solution", {"code": combo})]
+
+
+# ---------------------------------------------------------------------------
+# qwen3 (Qwen3.5+/3.6 XML convention)
+# ---------------------------------------------------------------------------
+
+from training_sessions_cookbook.rl.envs.tool_render import SUPPORTED_FAMILIES
+
+# The qwen3 format carries parameter values as raw text (no escaping exists in
+# the format), so the round-trip guarantee excludes values containing the
+# format's own closing tags; such values are unrepresentable for the model
+# too. Everything else (newlines, quotes, braces, unicode, im_start markers)
+# must survive verbatim, modulo the framing newlines the renderer adds.
+_QWEN_CLOSERS = ["</parameter>", "</function>", "</tool_call>"]
+_qwen_code = st.text(st.characters(), max_size=200).filter(
+    lambda s: not any(c in s for c in _QWEN_CLOSERS)
+    and s == s.strip("\n")  # framing newlines are stripped on parse
+)
+
+
+@settings(max_examples=200, deadline=None)
+@given(code=_qwen_code)
+def test_qwen3_round_trip_single_arg(code):
+    rendered = render_tool_call("check_solution", {"code": code}, family="qwen3")
+    calls = parse_tool_calls(rendered, family="qwen3")
+    assert len(calls) == 1
+    assert calls[0].name == "check_solution"
+    assert calls[0].arguments == {"code": code}
+
+
+def test_qwen3_realistic_model_output_parses():
+    """Reasoning text before the call (allowed by the template), then XML."""
+    out = (
+        "Let me verify my solution first.\n\n"
+        "<tool_call>\n<function=check_solution>\n"
+        "<parameter=code>\nimport sys\nprint(sys.stdin.read()[::-1])\n</parameter>\n"
+        "</function>\n</tool_call>"
+    )
+    calls = parse_tool_calls(out, family="qwen3")
+    assert calls == [
+        ToolCall(name="check_solution",
+                 arguments={"code": "import sys\nprint(sys.stdin.read()[::-1])"})
+    ]
+
+
+def test_qwen3_multi_parameter_call():
+    rendered = render_tool_call("f", {"a": "1\n2", "b": "x"}, family="qwen3")
+    (call,) = parse_tool_calls(rendered, family="qwen3")
+    assert call.arguments == {"a": "1\n2", "b": "x"}
+
+
+def test_qwen3_schema_matches_model_template_conventions():
+    """Pin the invariants the Qwen3.6 chat template mandates."""
+    schema = render_tool_schema([check_solution_tool_spec()], family="qwen3")
+    assert schema.startswith("<|im_start|>system")
+    assert schema.rstrip().endswith("<|im_end|>")
+    assert "<tools>" in schema and "</tools>" in schema
+    assert '"name": "check_solution"' in schema
+    # invocation format is the XML function/parameter form, NOT a JSON payload
+    assert "<function=example_function_name>" in schema
+    assert '"arguments"' not in schema.split("</tools>")[1]
+
+
+def test_qwen3_result_is_tool_response_in_user_turn():
+    """The template detects multi-step turns by this exact wrapping."""
+    result = render_tool_result("check_solution", '{"passed": false}', family="qwen3")
+    assert result.startswith("<|im_start|>user\n<tool_response>")
+    assert result.rstrip().endswith("</tool_response><|im_end|>")
+    assert '{"passed": false}' in result
+
+
+def test_qwen3_final_answer_has_no_tool_call():
+    assert parse_tool_calls("The answer is 42.", family="qwen3") == []
+
+
+def test_qwen3_fenced_fallback_shared():
+    out = '```tool_call\n{"name": "check_solution", "arguments": {"code": "x"}}\n```'
+    (call,) = parse_tool_calls(out, family="qwen3")
+    assert call.name == "check_solution" and call.arguments == {"code": "x"}
+
+
+def test_unsupported_family_raises_with_supported_list():
+    for fn in (
+        lambda: render_tool_schema([], family="llama3"),
+        lambda: render_tool_call("f", {}, family="llama3"),
+        lambda: render_tool_result("f", "x", family="llama3"),
+        lambda: parse_tool_calls("y", family="llama3"),
+    ):
+        try:
+            fn()
+            raise AssertionError("expected ValueError")
+        except ValueError as e:
+            assert "supported:" in str(e)
+    assert set(SUPPORTED_FAMILIES) == {"gpt_oss", "qwen3", "gemma"}

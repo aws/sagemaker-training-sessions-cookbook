@@ -8,6 +8,7 @@ from typing import Optional
 from training_sessions_cookbook.service import read_jsonl
 
 from .envs.gsm8k import BUILTIN_GSM8K_20
+from .config import cfg
 
 
 # === Training-datum builder ===
@@ -66,20 +67,20 @@ def _build_val_dataset(args):
     For non-code envs only (2) applies. Returns ``None`` when neither is set.
     """
     if (
-        getattr(args, "env_type", None) == "code_rl"
-        and getattr(args, "val_code_split", "none") != "none"
+        cfg(args, "env_type") == "code_rl"
+        and cfg(args, "val_code_split") != "none"
     ):
         # Lazy import so the GSM8K path never pulls in datasets.
         from .envs.deepcoder import load_deepcoder_tasks
 
         return load_deepcoder_tasks(
             split=args.val_code_split,
-            seed=getattr(args, "seed", 0),
-            max_prompts=getattr(args, "val_max_prompts", None),
+            seed=cfg(args, "seed"),
+            max_prompts=cfg(args, "val_max_prompts"),
         )
-    if getattr(args, "val_dataset_path", None):
+    if cfg(args, "val_dataset_path"):
         return load_dataset(
-            args.val_dataset_path, getattr(args, "val_max_prompts", None)
+            args.val_dataset_path, cfg(args, "val_max_prompts")
         )
     return None
 

@@ -100,7 +100,15 @@ class SandboxFusionClient:
 
         try:
             session = await self._get_session()
-            async with session.post(self._url, json=payload) as resp:
+            # Per-request deadline: the sandbox enforces `run_timeout` on the
+            # execution itself, so a healthy response arrives within roughly
+            # that budget plus transfer/queueing. Without this, a wedged
+            # sandbox holds the rollout worker for the session-level backstop
+            # (100 minutes) instead of failing this one episode quickly.
+            request_timeout = aiohttp.ClientTimeout(total=timeout + 60)
+            async with session.post(
+                self._url, json=payload, timeout=request_timeout
+            ) as resp:
                 if resp.status != 200:
                     error_text = await resp.text()
                     return False, {"error": f"HTTP {resp.status}: {error_text}"}
@@ -129,32 +137,47 @@ class SandboxFusionClient:
 # ---------------------------------------------------------------------------
 
 # Module-level lazily-created shared client. A single pooled client is reused across all grading calls so connections are pooled per ``SANDBOX_MAX_CONCURRENCY``.
-_client: SandboxFusionClient | None = None
+# One client per event loop, keyed by a weak reference to the loop.
+#
+# An ``aiohttp.ClientSession`` is bound to the event loop it was created on. A
+# process-global singleton therefore breaks the second ``asyncio.run()`` in the
+# same process (validation after training, back-to-back programmatic runs,
+# test suites): the cached session's loop is closed, and every request fails
+# with "Event loop is closed" / "attached to a different loop". Keying the
+# cache by the RUNNING loop gives each loop its own session, and the weak keys
+# let a dead loop's entry be collected.
+import weakref
+
+_clients: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+_atexit_registered = False
 
 
-def _close_client_at_exit() -> None:
-    """Close the shared client's HTTP session at interpreter exit.
+def _close_clients_at_exit() -> None:
+    """Close all cached clients' HTTP sessions at interpreter exit.
 
-    Without this, aiohttp logs "Unclosed client session" ERROR lines when the
-    still-open singleton is garbage-collected during teardown, alarming
-    noise at the end of an otherwise clean run.
+    Without this, aiohttp logs "Unclosed client session" ERROR lines when a
+    still-open client is garbage-collected during teardown, alarming noise at
+    the end of an otherwise clean run.
     """
-    client = _client
-    if client is None:
-        return
-    try:
-        asyncio.run(client.close())
-    except Exception:
-        pass  # teardown is best-effort; never fail exit
+    for client in list(_clients.values()):
+        try:
+            asyncio.run(client.close())
+        except Exception:
+            pass  # teardown is best-effort; never fail exit
 
 
 def _get_client() -> SandboxFusionClient:
-    """Get or create the shared SandboxFusion client singleton."""
-    global _client
-    if _client is None:
-        _client = SandboxFusionClient()
-        atexit.register(_close_client_at_exit)
-    return _client
+    """Get or create the SandboxFusion client for the current event loop."""
+    global _atexit_registered
+    loop = asyncio.get_running_loop()
+    client = _clients.get(loop)
+    if client is None:
+        client = SandboxFusionClient()
+        _clients[loop] = client
+        if not _atexit_registered:
+            atexit.register(_close_clients_at_exit)
+            _atexit_registered = True
+    return client
 
 
 async def sandbox_check_correctness(

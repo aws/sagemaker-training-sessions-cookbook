@@ -10,8 +10,6 @@
   "output_s3_path": "s3://YOUR_BUCKET/gsm8k-service-full/",
   "training_session_name": null,
   "save_weights_at_end": false,
-  "deploy_and_invoke": false,
-  "inference_role_arn": null,
   "batch_size": 128,
   "learning_rate": 4e-05,
   "max_tokens": 1024,
