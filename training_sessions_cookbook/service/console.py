@@ -162,6 +162,12 @@ def setup_console_logging(level: int = logging.INFO) -> None:
             return
     root.setLevel(level)
 
+    # botocore re-reads the shared credentials file for every client it builds
+    # and logs an INFO line each time - a dozen identical "Found credentials"
+    # lines per session open, drowning the training output. Cache-hit logging
+    # is noise, not signal; real credential problems surface as errors.
+    logging.getLogger("botocore.credentials").setLevel(logging.WARNING)
+
     handler = logging.StreamHandler(sys.stdout)
     handler.setLevel(level)
     handler.setFormatter(_ConsoleFormatter(colorize=sys.stdout.isatty()))

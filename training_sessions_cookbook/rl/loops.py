@@ -40,6 +40,7 @@ from .rollouts import (
 from .runstate import run_artifacts
 from .staleness import _AsyncLoopState, _PROMPT_SENTINEL, _StalenessBatcher, _WORKER_DONE
 from .validation import ValidationRunner
+from training_sessions_cookbook.service.session_watchdog import SessionDeadError
 
 
 def compute_learning_rate(step: int, base_lr: float, warmup_steps: int) -> float:
@@ -166,7 +167,10 @@ async def run_training(
         validation_runner is not None
         and cfg(args, "val_at_start")
     ):
-        sampling_client = backend.refresh_sampler(0)
+        # async twin: runs the blocking save+bind off-loop and is guarded by
+        # the session-liveness watchdog (the sync form would block the event
+        # loop, which also prevents the watchdog from detecting a dead session).
+        sampling_client = await backend.refresh_sampler_async(0)
         baseline_val_metrics = await validation_runner.run_validation(
             0,
             sampling_client,
@@ -192,7 +196,7 @@ async def run_training(
         if step % args.refresh_every == 0:
             # If --val_at_start already refreshed the sampler at step 0 with the initial weights, reuse it instead of re-refreshing (the trainer weights haven't changed yet).
             if not (step == 0 and sampling_client is not None):
-                sampling_client = backend.refresh_sampler(step)
+                sampling_client = await backend.refresh_sampler_async(step)
 
         # 2. Pull next batch of prompts. Empty -> dataset exhausted.
         step_start = time.time()
@@ -486,6 +490,12 @@ async def run_training_async(
         try:
             await _worker_loop()
         except asyncio.CancelledError:
+            raise
+        except SessionDeadError:
+            # The session is terminal server-side: every worker would die the
+            # same way one by one. Propagate so the loop fails once, with the
+            # service's reason, instead of 80 stack traces and a puzzling
+            # wind-down.
             raise
         except Exception:
             log.exception("off-by-k rollout worker died; sending its sentinel")

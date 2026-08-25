@@ -15,7 +15,12 @@ from pathlib import Path
 from typing import Any
 
 # <repo>/rl/analysis/_common.py -> repo root is three parents up.
-REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+# analysis/ -> rl/ -> training_sessions_cookbook/ -> repo root (four levels).
+# The three-level form was correct in the pre-package layout (rl/ sat at the
+# repo root); after the move it resolved to the package directory, so every
+# analysis entry point failed with "missing metrics file:
+# .../training_sessions_cookbook/results/...".
+REPO_ROOT = Path(__file__).resolve().parents[3]
 RESULTS_DIR = REPO_ROOT / "results"
 
 

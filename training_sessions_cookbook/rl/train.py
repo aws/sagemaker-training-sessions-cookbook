@@ -13,6 +13,7 @@ from training_sessions_cookbook.service.console import (
     setup_console_logging,
 )
 from training_sessions_cookbook.service.mlflow_log import add_mlflow_args
+from training_sessions_cookbook.service.config_file import apply_config_defaults, parse_known_config_path
 from training_sessions_cookbook.service.runlog import RunLog
 
 from .envs import env_cli_args, get_env_factory, registered_envs
@@ -53,6 +54,7 @@ from .metrics import (  # noqa: F401
     compute_advantage_stats,
     compute_episode_length_mean,
     compute_reward_stats,
+    compute_token_turn_stats,
     count_episodes,
     episodes_to_rollout_dicts,
     format_metrics_table,
@@ -72,53 +74,11 @@ from .validation import (  # noqa: F401
 # Run folder, config dump, and file logging are shared with the SFT path in ``service/runlog.py``; the aliases below preserve the names this module and its tests reference.
 
 def _apply_config_defaults(parser: argparse.ArgumentParser, config_path: str) -> None:
-    """Seed ``parser`` defaults from a JSON config so CLI flags still override.
+    """Deprecated alias for :func:`service.config_file.apply_config_defaults`.
 
-    Reads the JSON at ``config_path`` (the shape ``dump_config`` writes) and
-    for every key that matches a known argparse destination, calls
-    ``parser.set_defaults(dest=value)``. Because argparse applies an explicitly
-    supplied flag *over* its default, any flag on the command line still wins, the config only fills in the rest. Two consequences handled here:
-
-    * **Required args become satisfiable from the file.** ``--base_model`` is
-      ``required=True``; once the config supplies it, we clear ``required`` on
-      that action so a config-only invocation (no ``--base_model`` on the CLI)
-      does not error. If neither the config nor the CLI provides it, argparse
-      still errors as before.
-    * **Unknown keys are ignored** (with one warning listing them), so a real
-      ``config.json``, which carries ``git_hash`` and any future non-arg keys, loads cleanly.
-
-    ``--config`` itself and the meta key ``git_hash`` are never treated as args.
+    Kept because tests and external callers import this name from ``rl.train``.
     """
-    log = logging.getLogger(__name__)
-    with open(config_path) as f:
-        cfg = json.load(f)
-    if not isinstance(cfg, dict):
-        raise SystemExit(f"--config {config_path!r} must be a JSON object")
-
-    # Map every known destination -> its Action, so we can both set defaults and
-    # relax `required` for keys the config provides.
-    dest_to_action = {a.dest: a for a in parser._actions}
-    ignored = {"config", "git_hash"}
-
-    applied, unknown = {}, []
-    for key, value in cfg.items():
-        if key in ignored:
-            continue
-        if key in dest_to_action:
-            applied[key] = value
-            action = dest_to_action[key]
-            if getattr(action, "required", False):
-                action.required = False
-        else:
-            unknown.append(key)
-
-    if applied:
-        parser.set_defaults(**applied)
-    if unknown:
-        log.warning(
-            "--config %s: ignoring %d key(s) with no matching CLI flag: %s",
-            config_path, len(unknown), ", ".join(sorted(unknown)),
-        )
+    apply_config_defaults(parser, config_path)
 
 
 def build_parser(
@@ -507,11 +467,9 @@ def parse_with_config(parser: argparse.ArgumentParser, argv=None):
     # config's keys into `parser` as defaults, then do the real parse so
     # explicit CLI flags still override the file. When --config is absent this
     # is just a normal parse_args().
-    config_sniffer = argparse.ArgumentParser(add_help=False)
-    config_sniffer.add_argument("--config", default=None)
-    pre_args, _ = config_sniffer.parse_known_args(argv)
-    if pre_args.config is not None:
-        _apply_config_defaults(parser, pre_args.config)
+    config_path = parse_known_config_path(argv)
+    if config_path is not None:
+        apply_config_defaults(parser, config_path)
 
     args = parser.parse_args(argv)
 
@@ -613,10 +571,15 @@ async def run_async(args, *, env_factory=None, validation_runner=None) -> None:
     # sampler-refresh saves, which are policy-serving snapshots on the
     # --refresh_every cadence and are deliberately not recorded. save_every
     # defaults to max_steps, which never fires mid-run: final-save-only.
+    # The backend's session-liveness watchdog guards checkpoint waits too: a
+    # session that dies mid-save (including the final save) must fail loudly
+    # rather than hang. Backends without one (mocks) pass None = unguarded.
+    _watchdog = getattr(backend, "watchdog", None)
     checkpoint_manager = checkpoint_utils.CheckpointManager(
         backend.training_client,
         backend.service_client,
         run_folder,
+        watchdog=_watchdog,
         save_every=args.save_every,
         # Crash recovery: state-only background saves that self-prune (each
         # deletes the previous rolling package). Before this default, a run
@@ -720,6 +683,7 @@ async def run_async(args, *, env_factory=None, validation_runner=None) -> None:
         final_paths = await checkpoint_utils.save_checkpoint_async(
             backend.training_client,
             name="final",
+            watchdog=_watchdog,
             log_path=run_folder,
             # Label with the step that actually trained last - the dataset can
             # exhaust before max_steps, and a checkpoint claiming an untrained

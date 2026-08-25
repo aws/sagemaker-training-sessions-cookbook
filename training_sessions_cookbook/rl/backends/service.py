@@ -53,6 +53,7 @@ from sagemaker.train.training_session import AdamParams, LossFunction, SamplingP
 from training_sessions_cookbook.service import make_datum, open_session
 
 from .base import build_loss_fn_config, resolve_sampling_extras
+from training_sessions_cookbook.service.session_watchdog import SessionWatchdog, result_with_liveness
 from ..config import cfg
 
 logger = logging.getLogger(__name__)
@@ -165,6 +166,8 @@ class ServiceBackend:
         self._t = types  # {SamplingParams, AdamParams, LossFunction}
         self._last_weights_model_package = None  # set via note_deployable_checkpoint
         self._session_deleted = False  # set by delete_session (makes close a no-op)
+        # session-liveness watchdog (constructed lazily; see service/session_watchdog.py)
+        self._watchdog = None
 
     # --- construction ------------------------------------------------------
 
@@ -225,7 +228,16 @@ class ServiceBackend:
             else train_op_timeout
         )
         try:
-            tc.save_weights_for_sampler("initial").result(timeout=resolved_train_timeout)
+            # Liveness-aware wait: a session that dies during the initial save
+            # would otherwise hang create() forever WHILE BILLING (no exception
+            # means the stop-on-failure below never fires). No event loop exists
+            # yet, so this polls the future in slices and describes in between.
+            result_with_liveness(
+                tc.save_weights_for_sampler("initial"),
+                svc,
+                session_name,
+                timeout=resolved_train_timeout,
+            )
             # ARN-less client = base model, which IS the correct step-0 policy
             # (LoRA starts at zero delta). Every later refresh returns a NEW
             # client bound to the fresh checkpoint (see refresh_sampler); this
@@ -307,14 +319,46 @@ class ServiceBackend:
         expiry raises ``TimeoutError``, which the caller treats as a failed
         rollout and drops.
         """
-        return await asyncio.wait_for(
-            sampling_client.sample_async(
-                prompt=prompt,
-                num_samples=num_samples,
-                sampling_params=sampling_params,
+        return await self._await_guarded(
+            asyncio.wait_for(
+                sampling_client.sample_async(
+                    prompt=prompt,
+                    num_samples=num_samples,
+                    sampling_params=sampling_params,
+                ),
+                self._sample_op_timeout,
             ),
-            self._sample_op_timeout,
+            what="sample request",
         )
+
+    # --- session liveness watchdog ------------------------------------------
+    #
+    # Shared implementation in service/session_watchdog.py: polls
+    # DescribeTrainingSession and fails every guarded wait with the service's
+    # FailureReason when the session leaves the live states, instead of
+    # hanging forever on results that can never arrive.
+
+    @property
+    def watchdog(self):
+        """The session-liveness watchdog (created lazily; None before first use
+        or on backends without a session name, e.g. direct construction)."""
+        self._ensure_watchdog()
+        return self._watchdog
+
+    def _ensure_watchdog(self) -> None:
+        if self._watchdog is None:
+            # Only backends opened via create() know their session name; a
+            # directly-constructed backend (tests, programmatic embedding)
+            # cannot poll and degrades to unguarded waits rather than crashing.
+            name = getattr(self, "_session_name", None)
+            if name:
+                self._watchdog = SessionWatchdog(self._svc, name)
+
+    async def _await_guarded(self, awaitable: Any, what: str) -> Any:
+        self._ensure_watchdog()
+        if self._watchdog is None:
+            return await awaitable
+        return await self._watchdog.guard(awaitable, what=what)
 
     # --- sampler lifecycle -------------------------------------------------
 
@@ -352,10 +396,11 @@ class ServiceBackend:
         loop stays free and rollout workers keep sampling during the save.
         """
         if step > 0:
-            self._sampling_client = (
-                await self._tc.save_weights_and_get_sampling_client_async(
+            self._sampling_client = await self._await_guarded(
+                self._tc.save_weights_and_get_sampling_client_async(
                     f"refresh-{step:06d}"
-                )
+                ),
+                what=f"sampler refresh (step {step})",
             )
         return self._sampling_client
 
@@ -451,8 +496,14 @@ class ServiceBackend:
             datums, loss_fn=self._loss_fn(loss_name), loss_fn_config=loss_fn_config
         )
         optim_op = await self._tc.optim_step_async(adam_params)
-        fb_result = await asyncio.wait_for(fwd_bwd_op.result_async(), self._train_op_timeout)
-        opt_result = await asyncio.wait_for(optim_op.result_async(), self._train_op_timeout)
+        fb_result = await self._await_guarded(
+            asyncio.wait_for(fwd_bwd_op.result_async(), self._train_op_timeout),
+            what="forward_backward",
+        )
+        opt_result = await self._await_guarded(
+            asyncio.wait_for(optim_op.result_async(), self._train_op_timeout),
+            what="optim_step",
+        )
 
         # Merge optim metrics over fwd/bwd metrics so the train/* schema
         # carries both.
@@ -494,6 +545,9 @@ class ServiceBackend:
 
         No-op when :meth:`delete_session` already ran (the success path).
         """
+        watchdog = getattr(self, "_watchdog", None)
+        if watchdog is not None:
+            watchdog.stop()
         if self._session_deleted:
             return
         try:

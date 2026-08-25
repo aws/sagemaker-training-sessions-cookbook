@@ -79,6 +79,56 @@ def count_episodes(episodes: list) -> tuple:
     return non_empty, failed
 
 
+def compute_token_turn_stats(episodes: list, transitions: list) -> dict:
+    """Token-volume and turn-count stats from the rollout structures.
+
+    Backend-agnostic: computed purely from ``Transition.obs_tokens`` /
+    ``act_tokens`` and the episode grouping, which are shared rollout code. All
+    keys are namespaced under ``rollout/`` by the caller. Empty inputs yield
+    zeros so the JSONL schema stays stable across steps.
+
+    These drive the ``tokens`` figure family in ``rl/analysis/plot_runs.py``
+    (token budget and turn distribution are what ``--max_turns`` /
+    ``--max_tokens`` are tuned against). The function was lost when the metrics
+    helpers moved into this module, which left that figure family silently
+    unpopulated for every run after the move.
+    """
+    non_empty = [ep for ep in episodes if ep]
+    flat = [t for ep in non_empty for t in ep]
+    if not flat:
+        return {
+            "ac_tokens_per_turn": 0.0, "ob_tokens_per_turn": 0.0,
+            "response_tokens_min": 0.0, "response_tokens_max": 0.0,
+            "response_tokens_std": 0.0, "turns_per_episode": 0.0,
+            "total_turns": 0, "total_episodes": 0,
+            "total_ac_tokens": 0, "total_ob_tokens": 0,
+            "frac_max_turns_reached": 0.0,
+        }
+    ac = [len(t.act_tokens) for t in flat]
+    ob = [len(t.obs_tokens) for t in flat]
+    turns_per_ep = [len(ep) for ep in non_empty]
+    # An episode "reached max turns" if it ran out of turns rather than ending
+    # early on a reward-driven done: >1 turn and a done final transition.
+    # Single-turn envs report 0 by construction.
+    max_turns_hits = sum(1 for ep in non_empty if len(ep) > 1 and ep[-1].done)
+    n = len(ac)
+    mean_ac = sum(ac) / n
+    var_ac = sum((x - mean_ac) ** 2 for x in ac) / n
+    return {
+        "ac_tokens_per_turn": mean_ac,
+        "ob_tokens_per_turn": sum(ob) / n,
+        "response_tokens_min": float(min(ac)),
+        "response_tokens_max": float(max(ac)),
+        "response_tokens_std": var_ac ** 0.5,
+        "turns_per_episode": sum(turns_per_ep) / len(turns_per_ep),
+        "total_turns": int(n),
+        "total_episodes": int(len(non_empty)),
+        "total_ac_tokens": int(sum(ac)),
+        "total_ob_tokens": int(sum(ob)),
+        "frac_max_turns_reached": max_turns_hits / len(non_empty),
+    }
+
+
 def compute_group_health_stats(groups: list) -> dict:
     """Per-GRPO-group success composition (grouped advantage mode only).
 
@@ -252,6 +302,10 @@ class MetricsLogger:
         num_eps, num_failed = count_episodes(episodes)
         record["rollout/num_episodes"] = num_eps
         record["rollout/num_failed_rollouts"] = num_failed
+
+        # Token volume + turn distribution (drives the `tokens` plot family).
+        for k, v in compute_token_turn_stats(episodes, transitions).items():
+            record[f"rollout/{k}"] = v
 
         # Per-GRPO-group success composition (grouped advantage mode only).
         for k, v in compute_group_health_stats(groups).items():

@@ -16,6 +16,8 @@ from training_sessions_cookbook.service.console import (
     setup_console_logging,
 )
 from training_sessions_cookbook.service import learning_rate, open_session
+from training_sessions_cookbook.service.config_file import apply_config_defaults, parse_known_config_path
+from training_sessions_cookbook.service.session_watchdog import NullWatchdog, SessionWatchdog
 from training_sessions_cookbook.service.mlflow_log import add_mlflow_args
 from training_sessions_cookbook.service.runlog import RunLog
 from training_sessions_cookbook.sft.data import build_sft_batches
@@ -88,14 +90,33 @@ def build_parser() -> argparse.ArgumentParser:
     # MLflow (optional)
     add_mlflow_args(parser)
 
+    # A JSON file whose keys seed the argparse DEFAULTS, so any flag passed
+    # explicitly still wins over the file. A finished run's config.json is
+    # exactly this shape, which makes runs directly re-runnable:
+    #   --config results/<run>/config.json
+    parser.add_argument(
+        "--config", default=None,
+        help="Path to a JSON config (dump_config/config.json shape) whose keys "
+             "become defaults; explicit CLI flags override them.",
+    )
+
     return parser
 
 
 def parse_args(argv=None):
-    """Parse ``argv`` (default: ``sys.argv``). Pass a list when calling from
-    a notebook or another program so the host process's own argv is ignored.
+    """Parse ``argv`` (default: ``sys.argv``) with ``--config`` file support.
+
+    Pass a list when calling from a notebook or another program so the host
+    process's own argv is ignored. Two-pass parse: sniff ``--config`` first
+    (argparse cannot satisfy required args from a file it has not read yet),
+    fold its keys in as defaults, then parse for real so explicit CLI flags
+    still override the file.
     """
-    return build_parser().parse_args(argv)
+    parser = build_parser()
+    config_path = parse_known_config_path(argv)
+    if config_path is not None:
+        apply_config_defaults(parser, config_path)
+    return parser.parse_args(argv)
 
 
 # === Metrics and evaluation ===
@@ -141,14 +162,22 @@ def _actor_loss(result):
     return None
 
 
-async def evaluate(training_client, eval_batches, loss_fn) -> dict[str, float]:
-    """Run a forward-only pass on eval data and return ``eval/mean_nll``."""
+async def evaluate(training_client, eval_batches, loss_fn, *, watchdog=None) -> dict[str, float]:
+    """Run a forward-only pass on eval data and return ``eval/mean_nll``.
+
+    ``watchdog`` (optional) fails the eval fast if the session dies
+    server-side mid-pass, instead of hanging on results that can never arrive.
+    """
     total_weighted = 0.0
     total_weights = 0.0
 
     for batch in eval_batches:
         fwd_future = await training_client.forward_async(batch, loss_fn=loss_fn)
-        fwd_result = await fwd_future.result_async()
+        wait = fwd_future.result_async()
+        if watchdog is not None:
+            fwd_result = await watchdog.guard(wait, what="eval forward")
+        else:
+            fwd_result = await wait
         actor_loss = _actor_loss(fwd_result)
         if actor_loss is not None:
             batch_nll = compute_nll_from_actor_loss(actor_loss, batch)
@@ -238,10 +267,17 @@ async def run_async(args, *, train_batches=None, eval_batches=None) -> None:
         runlog.set_tags({
             "training_session_name": training_client.training_session_name,
         })
+        # Fail fast if the session dies server-side mid-run (engine fault
+        # etc.); without this the result_async() awaits in the loop would hang
+        # forever on results that can never arrive. Created here (not inside
+        # _train) so the finally below stops the poller on EVERY exit path -
+        # success, exception, or cancellation.
+        watchdog = SessionWatchdog(svc, training_client.training_session_name)
         try:
             await _train(args, session_name, runlog, svc, training_client,
                          tokenizer, resume_record=resume_record,
-                         train_batches=train_batches, eval_batches=eval_batches)
+                         train_batches=train_batches, eval_batches=eval_batches,
+                         watchdog=watchdog)
         except BaseException:
             # Stop (not delete) the session so a mid-training crash doesn't
             # leave billed GPU resources running. Stopping preserves the
@@ -253,11 +289,21 @@ async def run_async(args, *, train_batches=None, eval_batches=None) -> None:
             except Exception as exc:
                 logger.warning("Failed to stop session %s: %r", session_name, exc)
             raise
+        finally:
+            watchdog.stop()
 
 
 async def _train(args, session_name, runlog, svc, training_client, tokenizer,
-                 resume_record=None, train_batches=None, eval_batches=None):
-    """The training loop body (async, mirroring the RL path's call pattern)."""
+                 resume_record=None, train_batches=None, eval_batches=None,
+                 watchdog=None):
+    """The training loop body (async, mirroring the RL path's call pattern).
+
+    ``watchdog`` is the caller-owned :class:`SessionWatchdog`; the caller
+    stops it in a ``finally`` so the poller never outlives the run on any
+    exit path. ``None`` (programmatic callers) degrades to unguarded waits.
+    """
+    if watchdog is None:
+        watchdog = NullWatchdog()
 
     # --- Dataset --------------------------------------------------------
     # Injected batches (list, or callable(tokenizer) -> batches) win; otherwise
@@ -327,6 +373,7 @@ async def _train(args, session_name, runlog, svc, training_client, tokenizer,
         training_client,
         svc,
         runlog.run_folder,
+        watchdog=watchdog,
         save_every=args.save_every,
         ttl_seconds=args.checkpoint_ttl_seconds,
         rolling_save_every=args.rolling_save_every,
@@ -376,8 +423,12 @@ async def _train(args, session_name, runlog, svc, training_client, tokenizer,
                 beta2=args.adam_beta2,
                 eps=args.adam_eps,
             ))
-            fb_result = await fb_future.result_async()
-            opt_result = await opt_future.result_async()
+            fb_result = await watchdog.guard(
+                fb_future.result_async(), what="forward_backward"
+            )
+            opt_result = await watchdog.guard(
+                opt_future.result_async(), what="optim_step"
+            )
             elapsed = time.time() - t0
 
             # 3. Calculate the per-token NLL from the returned actor/loss.
@@ -412,7 +463,7 @@ async def _train(args, session_name, runlog, svc, training_client, tokenizer,
 
             # 6. Periodic eval. Runs a forward-only pass over the held-out batches every --eval_every steps; the eval NLL is merged into this step's record.
             if eval_batches and args.eval_every > 0 and step % args.eval_every == 0:
-                eval_metrics = await evaluate(training_client, eval_batches, LossFunction.CROSS_ENTROPY)
+                eval_metrics = await evaluate(training_client, eval_batches, LossFunction.CROSS_ENTROPY, watchdog=watchdog)
                 metrics.update(eval_metrics)
                 logger.info("  eval/mean_nll=%.4f", eval_metrics.get("eval/mean_nll", float("nan")))
 

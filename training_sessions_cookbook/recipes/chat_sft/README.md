@@ -24,7 +24,17 @@ python -m training_sessions_cookbook.recipes.chat_sft.train \
 python -m training_sessions_cookbook.recipes.chat_sft.train ... \
     --dataset_path HuggingFaceH4/ultrachat_200k \
     --train_split train_sft --eval_split test_sft
+
+# Or drive everything from a preset config
+python -m training_sessions_cookbook.recipes.chat_sft.train \
+    --config training_sessions_cookbook/recipes/chat_sft/configs/sft_tulu3.json \
+    --role_arn "$ROLE_ARN" --model_package_group_arn "$MODEL_PACKAGE_GROUP_ARN" \
+    --output_s3_path "$OUTPUT_S3_PATH"
 ```
+
+Any flag passed explicitly overrides the preset. A finished run's
+`config.json` is the same shape, so a run can be reproduced with
+`--config results/<run>/config.json`.
 
 Ready-made launchers: [`examples/sft_tulu3.sh`](../../../examples/sft_tulu3.sh),
 [`examples/sft_ultrachat.sh`](../../../examples/sft_ultrachat.sh).

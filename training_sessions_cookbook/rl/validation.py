@@ -23,6 +23,7 @@ from training_sessions_cookbook.service.console import console_print, console_ru
 
 from .prompts import encode_prompt
 from .config import cfg
+from training_sessions_cookbook.service.session_watchdog import SessionDeadError
 
 
 # === Validation utilities ===
@@ -159,6 +160,8 @@ class ValidationRunner:
                     # SageMaker training-session SDK response shape: `result.samples[i].tokens` / `.logprobs`.
                     sequence = result.samples[0]
                     response_text = tokenizer.decode(list(sequence.tokens))
+                except SessionDeadError:
+                    raise  # dead session: fail validation loudly, not per-prompt
                 except Exception as exc:
                     log.warning(
                         "validation: sample failure for prompt=%r: %r",

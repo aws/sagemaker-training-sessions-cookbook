@@ -16,6 +16,7 @@ from typing import Optional
 from .backends import TrainingBackend
 from .prompts import encode_prompt
 from .envs.tool_render import generation_opener
+from training_sessions_cookbook.service.session_watchdog import SessionDeadError
 from .config import cfg
 
 
@@ -164,6 +165,11 @@ async def rollout_one(
             sequence = result.samples[0]
             act_tokens = list(sequence.tokens)
             act_logprobs = list(sequence.logprobs)
+        except SessionDeadError:
+            # The session is terminal server-side: no retry can ever succeed.
+            # Swallowing this like an ordinary sample failure turns a dead
+            # session into an infinite warn-requeue-resubmit churn.
+            raise
         except Exception as exc:  # sampling is best-effort
             log.warning(
                 "rollout_one: sample failure for prompt id=%r: %r",
@@ -279,6 +285,11 @@ async def rollout_one_code(
             sequence = result.samples[0]
             act_tokens = list(sequence.tokens)
             act_logprobs = list(sequence.logprobs)
+        except SessionDeadError:
+            # The session is terminal server-side: no retry can ever succeed.
+            # Swallowing this like an ordinary sample failure turns a dead
+            # session into an infinite warn-requeue-resubmit churn.
+            raise
         except Exception as exc:  # sampling is best-effort
             log.warning(
                 "rollout_one_code: sample failure for prompt id=%r: %r",

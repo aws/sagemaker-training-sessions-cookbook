@@ -45,6 +45,8 @@ from .data_io import read_jsonl
 
 CHECKPOINTS_BASE_NAME = "checkpoints.jsonl"
 
+from training_sessions_cookbook.service.session_watchdog import SessionDeadError
+
 logger = logging.getLogger(__name__)
 
 _MISSING = object()  # sentinel distinguishing "not passed" from None
@@ -182,6 +184,7 @@ async def save_checkpoint_async(
     loop_state: dict[str, Any],
     kind: Literal["state", "sampler", "both"] = "state",
     ttl_seconds: int | None = None,
+    watchdog: Any | None = None,
 ) -> dict[str, str]:
     """Save checkpoint(s) and append one record to ``checkpoints.jsonl``.
 
@@ -214,7 +217,10 @@ async def save_checkpoint_async(
 
     paths: dict[str, str] = {}
     for key, fut in futures.items():
-        arn = _arn_of(await fut)
+        # A session that dies server-side mid-save would otherwise hang this
+        # await forever; the watchdog fails it with the service's FailureReason.
+        wait = fut if watchdog is None else watchdog.guard(fut, what=f"save_{key} {name!r}")
+        arn = _arn_of(await wait)
         if arn:
             paths[key + "_path"] = arn
         else:
@@ -331,6 +337,7 @@ class CheckpointManager:
         rolling_save_every: int = 0,
         rolling_ttl_seconds: int | None = None,
         async_periodic_saves: bool = False,
+        watchdog: Any | None = None,
     ) -> None:
         self._training_client = training_client
         self._service_client = service_client
@@ -344,6 +351,7 @@ class CheckpointManager:
         self._pending_rolling: asyncio.Task[None] | None = None
         self._pending_periodic: asyncio.Task[dict[str, str]] | None = None
         self._prev_rolling_arn: str | None = None
+        self._watchdog = watchdog
 
     # --- periodic ----------------------------------------------------------
 
@@ -360,6 +368,7 @@ class CheckpointManager:
             loop_state=loop_state,
             kind="both",
             ttl_seconds=self._ttl_seconds,
+            watchdog=self._watchdog,
         )
 
     # --- rolling -----------------------------------------------------------
@@ -441,6 +450,7 @@ class CheckpointManager:
             loop_state={**loop_state, "final": True},
             kind="both",
             ttl_seconds=None,
+            watchdog=self._watchdog,
         )
         await self.finalize_async()
         return paths
@@ -462,6 +472,8 @@ class CheckpointManager:
             return
         try:
             await self._pending_rolling
+        except SessionDeadError:
+            raise  # dead session: no retry can succeed; fail the run loudly
         except Exception:
             logger.warning("Rolling checkpoint save failed", exc_info=True)
         self._pending_rolling = None
@@ -471,6 +483,8 @@ class CheckpointManager:
             return
         try:
             await self._pending_periodic
+        except SessionDeadError:
+            raise  # dead session: no retry can succeed; fail the run loudly
         except Exception:
             logger.warning("Background periodic checkpoint save failed", exc_info=True)
         self._pending_periodic = None
@@ -483,6 +497,7 @@ class CheckpointManager:
             loop_state={**loop_state, "rolling": True},
             kind="state",
             ttl_seconds=self._rolling_ttl_seconds,
+            watchdog=self._watchdog,
         )
         # Only after the new save exists is the previous one safe to delete.
         await self._delete_prev_rolling()
