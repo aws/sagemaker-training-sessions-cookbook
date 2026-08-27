@@ -235,7 +235,7 @@ def capture_rollouts(args, step: int, episodes: list, tokenizer, metrics_path: s
     * ``--record_trajectories``: append every episode's decoded turns to
       ``{run_folder}/trajectories.jsonl`` (uploaded as an MLflow artifact at
       the end of the run when publishing is enabled).
-    * ``--mlflow_log_rollouts N``: publish the first N episodes of this step
+    * ``--mlflow_traces_per_step N``: publish the first N episodes of this step
       as MLflow traces (visible live in the experiment's Traces view).
     """
     if cfg(args, "record_trajectories"):
@@ -245,7 +245,7 @@ def capture_rollouts(args, step: int, episodes: list, tokenizer, metrics_path: s
         )
         record_trajectories(traj_path, step, episodes, tokenizer)
 
-    n_traces = int(cfg(args, "mlflow_log_rollouts") or 0)
+    n_traces = int(cfg(args, "mlflow_traces_per_step") or 0)
     publisher = run_artifacts(args).mlflow
     if n_traces != 0 and publisher is not None:
         publisher.log_rollout_traces(

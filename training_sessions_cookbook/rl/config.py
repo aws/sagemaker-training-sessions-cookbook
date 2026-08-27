@@ -49,7 +49,7 @@ DEFAULTS: dict[str, Any] = {
     "max_steps_off_policy": 0,
     "max_tokens": 2048,
     "max_trajectory_tokens": 32768,
-    "mlflow_log_rollouts": 0,
+    "mlflow_traces_per_step": 0,
     "num_rollout_workers": 4,
     "record_trajectories": False,
     "region": "us-west-2",

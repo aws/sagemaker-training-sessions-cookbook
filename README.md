@@ -68,7 +68,14 @@ metrics. Shell launchers for all of them live in [`examples/`](examples/).
    model package group for checkpoints, and an S3 output path. All of them
    must be in the same region as `--region` (default `us-west-2`).
 
-3. **Run a recipe.**
+3. **Fetch a dataset** (only the GSM8K recipe needs this; the SFT and code-RL
+   recipes download theirs at runtime):
+
+   ```bash
+   python tools/download_gsm8k.py   # writes data/gsm8k_{train,test}.jsonl
+   ```
+
+4. **Run a recipe.**
 
    ```bash
    bash examples/sft_tulu3.sh        # or:
@@ -95,7 +102,14 @@ the checkpoint cadence options.
 Pass `--mlflow_tracking_uri` (a SageMaker managed MLflow App ARN or any plain
 MLflow URI) and the run's config, per-step metrics, checkpoint ARNs, and
 artifacts are published as they happen. RL runs can additionally publish
-decoded rollouts as traces with `--mlflow_log_rollouts N`.
+decoded rollouts as traces with `--mlflow_traces_per_step N`. Each trace is
+named `rollout_step30_ep7`, carries its reward as a filterable assessment, and
+is tagged with step/episode/reward/num_turns — so the Traces view can pull up
+exactly the rollouts that scored nothing (`feedback.reward = '0.0'`) or one
+step's worth (`tags.step = '30'`) and you can read the model's own reasoning
+turn by turn. Traces are a sampling tool: keep `N` small (large values overflow
+MLflow's export queue, which then discards traces) and use
+`--record_trajectories` when every episode must be captured.
 
 ```bash
 python -m training_sessions_cookbook.recipes.chat_sft.train ... \

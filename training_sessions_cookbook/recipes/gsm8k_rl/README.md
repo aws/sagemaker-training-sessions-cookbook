@@ -8,7 +8,19 @@ or `cispo`. A built-in 20-problem subset makes smoke runs dataset-free; use
 
 ## Run
 
-Set up the environment and account config first (see the [repo README](../../../README.md)), then:
+Set up the environment and account config first (see the [repo README](../../../README.md)),
+then fetch the dataset once (the preset below trains on the full GSM8K train
+split, which this writes to `data/gsm8k_train.jsonl` plus the test split used
+for validation):
+
+```bash
+python tools/download_gsm8k.py
+```
+
+Omit `--dataset_path` entirely to skip this and run on the built-in
+20-problem subset instead (useful for a smoke test, not for the numbers below).
+
+Then:
 
 ```bash
 python -m training_sessions_cookbook.recipes.gsm8k_rl.train \

@@ -15,6 +15,7 @@ tests pin the contract the trainers rely on:
 from __future__ import annotations
 
 import sys
+import time
 import unittest
 from unittest import mock
 
@@ -359,6 +360,35 @@ class RolloutTraceTest(unittest.TestCase):
         pub.end("FINISHED")
         names = [c[0] for c in mlflow_mock.calls]
         self.assertEqual(names, ["flush_trace_async_logging", "end_run"])
+
+    def test_assessment_latency_stays_off_the_training_path(self):
+        """A slow feedback backend must not lengthen a training step.
+
+        Assessments are one HTTP call per trace with no batch API, so they are
+        submitted to a worker pool and settled at run end. This pins that
+        contract: publishing must return promptly even when every assessment
+        call is slow, and every reward must still be attached by the time
+        ``end()`` returns.
+        """
+        mlflow_mock = make_mock_mlflow()
+        attached = []
+
+        def slow_log_feedback(**kwargs):
+            time.sleep(0.4)
+            attached.append(kwargs["value"])
+
+        mlflow_mock.log_feedback = slow_log_feedback
+        pub = MlflowPublisher(mlflow_mock, "run-123")
+
+        pub.log_rollout_traces(0, [self._rollout(1, i) for i in range(4)])
+        t0 = time.monotonic()
+        # Step 1 submits step 0's four assessments: 4 x 0.4s if it blocked.
+        pub.log_rollout_traces(1, [self._rollout(1, i) for i in range(4)])
+        elapsed = time.monotonic() - t0
+        self.assertLess(elapsed, 0.3, f"publishing blocked on assessments ({elapsed:.2f}s)")
+
+        pub.end("FINISHED")
+        self.assertEqual(len(attached), 8)
 
     def test_end_survives_missing_flush(self):
         mlflow_mock = make_mock_mlflow()

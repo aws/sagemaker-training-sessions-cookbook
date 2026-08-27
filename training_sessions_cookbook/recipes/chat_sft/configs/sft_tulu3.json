@@ -28,6 +28,5 @@
   "adam_eps": 1e-08,
   "mlflow_tracking_uri": null,
   "mlflow_experiment_name": null,
-  "mlflow_run_name": null,
-  "mlflow_log_rollouts": 0
+  "mlflow_run_name": null
 }

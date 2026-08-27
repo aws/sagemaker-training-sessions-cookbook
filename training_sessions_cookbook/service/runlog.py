@@ -178,10 +178,15 @@ class RunLog:
         config.setdefault("git_hash", git_hash())
         with open(os.path.join(folder, "config.json"), "w") as f:
             json.dump(config, f, indent=2, default=str)
+        # Attach training.log BEFORE building the sinks: sink construction logs
+        # (e.g. "MLflow publishing enabled ... run_id=...", the line that links
+        # this folder to the remote run), and those records belong in the file
+        # too - the docstring promises a complete record of the run.
+        file_handler = setup_file_logging(folder) if file_logging else None
         sinks = [s for f in _SINK_FACTORIES if (s := f(run_name, config))]
         runlog = cls(folder, sinks=sinks)
         if file_logging:
-            runlog._file_handler = setup_file_logging(folder)
+            runlog._file_handler = file_handler
             # Mirror the console layer (banner, rules, metric rows/tables)
             # into the same training.log, so the file is a complete plain
             # record of the run, not just the log records. Both the handler

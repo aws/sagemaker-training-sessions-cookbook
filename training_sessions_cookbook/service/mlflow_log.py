@@ -34,10 +34,28 @@ Design rules:
 from __future__ import annotations
 
 import logging
+import concurrent.futures
 import numbers
+import time
 import os
 import re
 from typing import Optional
+
+#: Attempts per assessment, and the linear backoff between them. Trace
+#: ingestion is eventually consistent: a "trace not found" is usually "not yet".
+_ASSESSMENT_ATTEMPTS = 3
+
+#: Worker threads attaching assessments off the training thread.
+_ASSESSMENT_WORKERS = 8
+
+#: Upper bound on how long run teardown waits for outstanding assessments.
+_ASSESSMENT_CLOSE_TIMEOUT_SECONDS = 30.0
+_ASSESSMENT_RETRY_BACKOFF_SECONDS = 2.0
+
+#: How long to wait for the backend to ingest the final step's traces before
+#: attaching their assessments at run end. Mid-run batches need no wait: they
+#: are drained a full training step later.
+_ASSESSMENT_INGEST_GRACE_SECONDS = 5.0
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +108,16 @@ class MlflowPublisher:
         self._mlflow = mlflow_module
         self.run_id = run_id
         self._consecutive_failures = 0
+        # (trace_id, reward) awaiting assessment; see _drain_assessments.
+        # (trace_id, reward, step, episode) awaiting attachment; deferred by a
+        # step so the backend has ingested the trace (see _drain_assessments).
+        self._pending_assessments: "list[tuple[str, float, int, int]]" = []
+        # Assessments are attached off the training thread: one HTTP call per
+        # trace, no batch API, so a slow backend must not lengthen a step.
+        self._assessment_pool = None
+        self._assessment_futures: list = []
+        self._assessments_failed = 0
+        self._assessments_total = 0
         self._ended = False
 
     # --- construction ------------------------------------------------------
@@ -227,6 +255,21 @@ class MlflowPublisher:
     def log_rollout_traces(self, step: int, rollouts: list) -> None:
         """Publish decoded rollout episodes as MLflow traces (one per episode).
 
+        Each trace is named ``rollout_step30_ep7`` and appears in the Traces
+        table's default-visible Trace name column; the step and episode are
+        also tags, shown as discrete fields once the (opt-in) Tags column is
+        enabled. The reward is attached as a feedback *assessment* (shown
+        in the Assessments column, filterable by exact value:
+        ``feedback.reward = '0.0'`` pulls up the rollouts that scored nothing),
+        and the same coordinates go out as tags for precise queries, e.g.
+        ``tags.step = '30' AND tags.reward = '0.0000'``.
+
+        Traces are a *sampling* tool. MLflow exports them on a background
+        queue holding 1000 by default and DISCARDS the overflow, so a step that
+        publishes more than that loses traces (raise
+        ``MLFLOW_ASYNC_TRACE_LOGGING_MAX_QUEUE_SIZE`` if you really need it).
+        Use ``--record_trajectories`` when every episode must be captured.
+
         Each item in ``rollouts`` is a plain dict:
         ``{"episode": int, "turns": [{"prompt", "response", "reward",
         "advantage", "done"}, ...]}``, already decoded to text by the caller
@@ -237,15 +280,171 @@ class MlflowPublisher:
         MLflow (the trace processor records the active run as the source run)
         and appear in the experiment's Traces view.
         """
+        # Assessments attach only to an ALREADY-INGESTED trace, and ingestion is
+        # asynchronous end to end: flushing the client queue does not mean the
+        # backend has committed the traces. Assessing immediately worked for a
+        # handful of traces and failed for a thousand
+        # ("RESOURCE_DOES_NOT_EXIST: Trace ... not found") - a race that only
+        # appears at scale. So assessments for THIS step are queued and attached
+        # at the start of the next step: a whole training step of delay, at no
+        # cost to the hot path and with no retry loop or sleep.
+        self._drain_assessments()
+
+        emitted: "list" = []
         for rollout in rollouts:
             self._call(
                 "log_rollout_trace",
-                lambda m, _r=rollout: self._emit_rollout_trace(m, step, _r),
+                lambda m, _r=rollout: emitted.append(
+                    self._emit_rollout_trace(m, step, _r)
+                ),
+            )
+        self._pending_assessments.extend(
+            (tid, reward, step, ep) for (tid, reward, ep) in (e for e in emitted if e)
+        )
+
+    _SOURCE_UNSET = object()
+    _assessment_source_cache = _SOURCE_UNSET
+
+    @classmethod
+    def _assessment_source(cls):
+        """``AssessmentSource`` identifying these as programmatic (CODE) feedback.
+
+        MLflow's guidance is a specific, traceable ``source_id`` rather than a
+        generic label, so the reward's provenance is unambiguous when a trace
+        also carries human or LLM-judge feedback. Returns ``None`` on older
+        mlflow builds without the entities, where feedback is logged unsourced.
+        """
+        if cls._assessment_source_cache is not cls._SOURCE_UNSET:
+            return cls._assessment_source_cache
+        try:
+            from mlflow.entities import AssessmentSource
+            from mlflow.entities.assessment_source import AssessmentSourceType
+
+            source = AssessmentSource(
+                source_type=AssessmentSourceType.CODE,
+                source_id="training_sessions_cookbook.rl.reward",
+            )
+        except Exception:
+            source = None
+        cls._assessment_source_cache = source
+        return source
+
+    def _drain_assessments(self) -> None:
+        """Hand queued reward assessments (from an earlier step) to a worker pool.
+
+        Fire-and-forget: observability must not lengthen a training step, and
+        MLflow offers no batch feedback API - each assessment is its own HTTP
+        round-trip that may retry. So the training thread only submits, and
+        :meth:`end` settles the stragglers within a bounded wait.
+
+        Failures are counted and reported once rather than per trace, and they
+        deliberately bypass :meth:`_call`: assessments are a convenience, and
+        must never trip the publisher-wide disable that protects metric
+        logging (a burst of them once silenced an entire run's metrics).
+        """
+        pending, self._pending_assessments = self._pending_assessments, []
+        if not pending:
+            return
+        log_feedback = getattr(self._mlflow, "log_feedback", None)
+        if log_feedback is None:  # older mlflow without the assessments API
+            return
+
+        def _one(item):
+            # Resolved inside the worker: building the source imports
+            # mlflow.entities, and that import must not land on the training
+            # thread (measured ~2s on first touch).
+            source = self._assessment_source()
+            trace_id, reward, step, episode = item
+            kwargs = {
+                "trace_id": trace_id,
+                "name": "reward",
+                "value": float(reward),
+                "metadata": {"step": str(step), "episode": str(episode)},
+            }
+            if source is not None:
+                kwargs["source"] = source
+            # Ingestion is eventually consistent, so a miss is usually "not
+            # yet" rather than "never": retry briefly instead of relying on
+            # the one-step deferral alone (back-to-back steps, or a fast
+            # recipe, can close that gap to nothing).
+            for attempt in range(_ASSESSMENT_ATTEMPTS):
+                try:
+                    log_feedback(**kwargs)
+                    return True
+                except Exception:
+                    if attempt == _ASSESSMENT_ATTEMPTS - 1:
+                        return False
+                    time.sleep(_ASSESSMENT_RETRY_BACKOFF_SECONDS * (attempt + 1))
+            return False
+
+        if self._assessment_pool is None:
+            self._assessment_pool = concurrent.futures.ThreadPoolExecutor(
+                max_workers=_ASSESSMENT_WORKERS, thread_name_prefix="mlflow-assess",
+            )
+        self._assessment_futures.extend(
+            self._assessment_pool.submit(_one, item) for item in pending
+        )
+        self._tally_assessments()
+
+    def _tally_assessments(self) -> None:
+        """Fold finished assessment futures into the run totals.
+
+        Called wherever futures are added or awaited, so the pending list stays
+        flat instead of growing with every published trace.
+        """
+        still_running = []
+        for fut in self._assessment_futures:
+            if not fut.done():
+                still_running.append(fut)
+                continue
+            self._assessments_total += 1
+            # Cancelled futures are counted, never unwrapped: CancelledError
+            # derives from BaseException, so result() would escape the guard.
+            if fut.cancelled():
+                self._assessments_failed += 1
+                continue
+            try:
+                if not fut.result():
+                    self._assessments_failed += 1
+            except Exception:
+                self._assessments_failed += 1
+        self._assessment_futures = still_running
+
+    def _close_assessments(self) -> None:
+        """Settle outstanding assessments within a bounded wait, then report.
+
+        The wait is bounded because this runs in the run's teardown path (a
+        shielded ``finally``, so it also runs on Ctrl-C): a slow or unreachable
+        backend must not hold the process open. Anything unfinished is
+        cancelled and counted.
+        """
+        if self._assessment_pool is None:
+            return
+        concurrent.futures.wait(
+            self._assessment_futures, timeout=_ASSESSMENT_CLOSE_TIMEOUT_SECONDS,
+        )
+        self._tally_assessments()
+        abandoned = len(self._assessment_futures)
+        self._assessment_pool.shutdown(wait=False, cancel_futures=True)
+        self._assessment_pool = None
+        self._assessment_futures = []
+        unattached = self._assessments_failed + abandoned
+        if unattached:
+            logger.warning(
+                "MLflow: %d of %d rollout reward assessments could not be "
+                "attached (traces may not have been ingested yet); traces, "
+                "metrics and the reward tag are unaffected.",
+                unattached, self._assessments_total + abandoned,
             )
 
     @staticmethod
-    def _emit_rollout_trace(mlflow_module, step: int, rollout: dict) -> None:
-        """Emit one episode as a trace: root AGENT span + one LLM span per turn."""
+    def _emit_rollout_trace(mlflow_module, step: int, rollout: dict):
+        """Emit one episode as a trace: root AGENT span + one LLM span per turn.
+
+        Returns ``(trace_id, total_reward, episode)`` so the caller can queue
+        the reward assessment for attachment once the trace is ingested (see
+        :meth:`_drain_assessments`).
+        """
         turns = rollout.get("turns") or []
         episode = rollout.get("episode", 0)
         total_reward = sum(float(t.get("reward") or 0.0) for t in turns)
@@ -259,6 +458,33 @@ class MlflowPublisher:
                 "reward": total_reward,
             },
         ) as root:
+            # Trace TAGS (not span attributes) are what the Traces view can
+            # filter on, so the same coordinates go out both ways: attributes
+            # for reading a trace, tags for finding one. ``step`` is
+            # zero-padded because tag values are strings and sort
+            # lexicographically ("0009" before "0010"). Verified against
+            # mlflow 3.14: `search_traces(filter_string="tags.step = '0030'")`
+            # and compound filters (step AND reward) both match.
+            update = getattr(mlflow_module, "update_current_trace", None)
+            if update is not None:  # older mlflow: attributes only
+                # Deliberately NOT grouped into an MLflow *session*: a session
+                # is a conversation, and its view numbers members "Turn 0,
+                # Turn 1, ...". Rollouts in a step are independent episodes,
+                # and multi-turn RL has real turns of its own (a tool call and
+                # its result), so that labelling would directly contradict the
+                # domain concept. Real turns are the child spans of one trace.
+                #
+                # The Request/Response previews are left alone: they exist to
+                # show the actual prompt and response, and prefixing them with
+                # coordinates would pollute the content. The step and episode
+                # are already in the trace NAME (a default-visible column) and
+                # in tags; the reward is a default-visible assessment.
+                update(tags={
+                    "step": str(step),
+                    "episode": str(episode),
+                    "reward": f"{total_reward:.4f}",
+                    "num_turns": str(len(turns)),
+                })
             root.set_inputs({"prompt": turns[0].get("prompt") if turns else None})
             for i, turn in enumerate(turns):
                 with mlflow_module.start_span(
@@ -276,6 +502,8 @@ class MlflowPublisher:
                 "response": turns[-1].get("response") if turns else None,
                 "reward": total_reward,
             })
+            trace_id = getattr(root, "trace_id", None)
+        return (trace_id, total_reward, episode) if trace_id else None
 
     def end(self, status: str = "FINISHED") -> None:
         """Terminate the MLflow run (``FINISHED``/``FAILED``). Idempotent.
@@ -289,8 +517,19 @@ class MlflowPublisher:
         self._ended = True
         try:
             self._mlflow.flush_trace_async_logging()
+            # The last step's assessments are still queued: the traces were
+            # just flushed, so give the backend a moment to ingest them before
+            # attaching (best-effort - a miss costs a badge, not data).
+            if self._pending_assessments:
+                time.sleep(_ASSESSMENT_INGEST_GRACE_SECONDS)
+                self._drain_assessments()
         except Exception:
             pass  # older mlflow builds may not have it; never block run end
+        # Settle whatever the worker pool still owes, bounded, and report once.
+        try:
+            self._close_assessments()
+        except Exception:
+            pass
         try:
             self._mlflow.end_run(status=status)
         except Exception as exc:
@@ -341,10 +580,14 @@ def add_mlflow_args(parser_or_group) -> None:
              "name).",
     )
     parser_or_group.add_argument(
-        "--mlflow_log_rollouts", type=int, default=0,
-        help="RL only: publish rollout episodes as MLflow traces (decoded "
-             "prompt/response per turn, with reward and advantage), shown in "
-             "the experiment's Traces view. N>0 = first N episodes per "
-             "training step; -1 = ALL episodes (beware volume: batch_size x "
-             "responses_per_prompt traces per step); 0 (default) = off.",
+        "--mlflow_traces_per_step", type=int, default=0,
+        help="RL only: how many rollout episodes to publish as MLflow traces "
+             "per training step (decoded prompt/response per turn, with the "
+             "reward as a filterable assessment). This is a SAMPLING knob: "
+             "small values (4-32) are what a human reads, and large ones "
+             "overflow MLflow's async export queue (1000 traces by default), "
+             "which then discards them. Use --record_trajectories to "
+             "capture every episode losslessly to the run folder instead. "
+             "N>0 = the first N episodes of each step; -1 = ALL episodes; "
+             "0 (default) = off.",
     )
