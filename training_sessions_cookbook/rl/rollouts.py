@@ -161,8 +161,7 @@ async def rollout_one(
                 num_samples=1,
                 sampling_params=sampling_params,
             )
-            # SageMaker training-session SDK response shape: `result.samples[i].tokens` / `.logprobs`. Extraction is inside the try so a shape mismatch or empty-samples response is caught as a warning rather than crashing the training loop.
-            sequence = result.samples[0]
+            sequence = result.sequences[0]
             act_tokens = list(sequence.tokens)
             act_logprobs = list(sequence.logprobs)
         except SessionDeadError:
@@ -281,8 +280,7 @@ async def rollout_one_code(
                 num_samples=1,
                 sampling_params=sampling_params,
             )
-            # See rollout_one: SageMaker SDK uses `.samples[i]`, extraction kept inside try so shape/empty errors surface as warnings.
-            sequence = result.samples[0]
+            sequence = result.sequences[0]
             act_tokens = list(sequence.tokens)
             act_logprobs = list(sequence.logprobs)
         except SessionDeadError:
@@ -388,6 +386,76 @@ async def collect_batch_async(
             )
 
     return await asyncio.gather(*[_one(prompt) for prompt in prompts])
+
+
+async def collect_grouped_batch_streamed_async(
+    prompts: list,
+    K: int,
+    sampling_client,
+    *,
+    args,
+    tokenizer,
+    env_factory,
+    template_fn,
+    backend: "TrainingBackend",
+    on_group_complete,
+) -> list[list[list[Transition]]]:
+    """Like :func:`collect_grouped_batch_async`, but reports each group as it finishes.
+
+    ``on_group_complete(group)`` (async) is awaited once per prompt-group, in
+    COMPLETION order, the moment that group's K episodes are all done - this is
+    what lets the training loop stream ``forward_backward`` sub-batches while
+    later rollouts are still generating (``--fb_stream_chunks``).
+
+    Concurrency is identical to the non-streamed collector: the same flat
+    per-episode semaphore (``args.num_rollout_workers``) gates every episode,
+    so K-episode groups complete exactly as fast as before. The return value
+    is also identical - groups in PROMPT order - so episode-level metrics and
+    the transitions view are unchanged; only the callback sees completion order.
+    """
+    sem = asyncio.Semaphore(args.num_rollout_workers)
+    sampling_params = backend.make_sampling_params(
+        max_tokens=args.max_tokens,
+        temperature=args.temperature,
+    )
+
+    rollout_fn = (
+        rollout_one_code
+        if cfg(args, "env_type") == "code_rl"
+        else rollout_one
+    )
+
+    async def _one(prompt):
+        async with sem:
+            env = env_factory()
+            return await rollout_fn(
+                prompt=prompt,
+                env=env,
+                template_fn=template_fn,
+                sampling_client=sampling_client,
+                sampling_params=sampling_params,
+                max_turns=args.max_turns,
+                tokenizer=tokenizer,
+                backend=backend,
+            )
+
+    async def _group(idx, prompt):
+        episodes = await asyncio.gather(*[_one(prompt) for _ in range(K)])
+        return idx, list(episodes)
+
+    tasks = [asyncio.create_task(_group(i, p)) for i, p in enumerate(prompts)]
+    groups: list = [None] * len(prompts)
+    try:
+        for fut in asyncio.as_completed(tasks):
+            idx, group = await fut
+            groups[idx] = group
+            await on_group_complete(group)
+    finally:
+        # A failing callback or rollout must not leak the sibling tasks.
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+    return groups
 
 
 async def collect_grouped_batch_async(

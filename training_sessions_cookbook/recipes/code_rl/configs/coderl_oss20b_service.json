@@ -11,6 +11,7 @@
   "training_session_name": null,
   "save_weights_at_end": false,
   "batch_size": 128,
+  "fb_stream_chunks": 4,
   "learning_rate": 1e-05,
   "max_tokens": 12288,
   "max_steps": 100,

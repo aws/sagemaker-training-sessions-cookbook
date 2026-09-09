@@ -50,6 +50,7 @@ DEFAULTS: dict[str, Any] = {
     "max_tokens": 2048,
     "max_trajectory_tokens": 32768,
     "mlflow_traces_per_step": 0,
+    "fb_stream_chunks": 4,
     "num_rollout_workers": 4,
     "record_trajectories": False,
     "region": "us-west-2",

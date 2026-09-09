@@ -119,11 +119,19 @@ if __name__ == "__main__":
     unittest.main()
 
 
-def test_echo_file_mirrors_console_layer_without_ansi(tmp_path):
+def test_echo_file_mirrors_console_layer_without_ansi(tmp_path, monkeypatch):
     """With an echo file set, banner/rule/rows/tables land in the file as
-    plain text (zero ANSI), and unsetting stops the mirror and releases it."""
+    plain text (zero ANSI), and unsetting stops the mirror and releases it.
+
+    Runs under Jupyter's color-forcing environment: kernels export
+    FORCE_COLOR/CLICOLOR_FORCE, which rich honors OVER the file's non-tty
+    status - a notebook-launched training once wrote raw ANSI into
+    training.log because of exactly this.
+    """
     from training_sessions_cookbook.service import console as c
 
+    monkeypatch.setenv("FORCE_COLOR", "1")
+    monkeypatch.setenv("CLICOLOR_FORCE", "1")
     echo = tmp_path / "training.log"
     c.add_console_echo_file(str(echo))
     try:

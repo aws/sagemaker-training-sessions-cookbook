@@ -22,8 +22,8 @@ the "SageMaker Training Sessions service" is expressed as a method here:
 
 The sampling-result contract the loop relies on: the loop calls
 ``await backend.sample_async(sampling_client, prompt, num_samples=, sampling_params=)``
-and the returned result must expose ``.samples[i].tokens`` and
-``.samples[i].logprobs``. ``sample_async`` submits without blocking the event
+and the returned result must expose ``.sequences[i].tokens`` and
+``.sequences[i].logprobs``. ``sample_async`` submits without blocking the event
 loop and awaits the result off-loop so many rollouts stay in-flight at once
 (the service backend uses the SDK's ``sample_async`` submit/await split).
 """
@@ -134,8 +134,8 @@ class TrainingBackend(Protocol):
         ``--num_rollout_workers`` requests can be genuinely in-flight at once.
         The service backend submits via the SDK's ``sample_async`` (fires the
         request on the loop, cheaply) then awaits the operation's blocking
-        The returned result must expose ``.samples[i].tokens`` and
-        ``.samples[i].logprobs``. Implementations must not block the event
+        The returned result must expose ``.sequences[i].tokens`` and
+        ``.sequences[i].logprobs``. Implementations must not block the event
         loop: submission and waiting go through the SDK's async API, with the
         wait governed by the backend's train-class ceiling (unbounded by
         default for the service backend).
@@ -176,6 +176,22 @@ class TrainingBackend(Protocol):
     def build_datum(self, transition: Any, *, temperature: float) -> Any:
         """Build one backend-native training datum from a rollout transition."""
         ...
+
+    # --- optional streaming protocol (--fb_stream_chunks) -------------------
+    #
+    # Backends MAY additionally implement:
+    #
+    #   async def submit_forward_backward(self, datums, *, loss_name) -> op
+    #   async def finish_train_step(self, fb_ops, *, learning_rate, beta1,
+    #                               beta2, eps) -> result   # same shape as train_step
+    #
+    # When both exist, the on-policy loop with --fb_stream_chunks N submits
+    # forward_backward sub-batches while rollouts are still generating
+    # (fire-and-forget) and settles them + optim once per step via
+    # finish_train_step - overlapping training compute with sampling at
+    # unchanged semantics (gradients accumulate server-side until optim).
+    # The loop feature-detects via hasattr: backends without these methods
+    # always get the monolithic train_step, flag or no flag.
 
     async def train_step(
         self,

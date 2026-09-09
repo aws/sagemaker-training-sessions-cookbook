@@ -22,12 +22,22 @@ from sagemaker.train.training_session import ServiceClient, AdamParams
 svc = ServiceClient(region=..., role_arn=..., model_package_group_arn=..., s3_output_path=...)
 tc = svc.create_lora_training_client(base_model, rank=64, alpha=128)
 
+# Train
 for batch in batches:
     fb = tc.forward_backward(batch, loss_fn="cross_entropy")   # returns a future
     opt = tc.optim_step(AdamParams(learning_rate=5e-5))        # pipelined behind it
     fb.result(), opt.result()
 
-print(tc.save_state().result().model_package_arn)              # resumable checkpoint
+# Save current weights and perform sampling
+sc = tc.save_weights_and_get_sampling_client()
+out = sc.sample(prompt, num_samples=8).result()                # Sample
+logprobs = sc.compute_logprobs(prompt).result()                # Get token logprobs
+
+# Or sample any saved checkpoint directly
+sc = svc.create_sampling_client(model_package_arn=...)
+
+# Checkpoint (resumable)
+print(tc.save_state().result().model_package_arn)
 ```
 
 The recipes here are complete training loops built on those calls, covering
@@ -96,6 +106,17 @@ other. SFT runs resume from an interruption with
 `--resume --log_path <run_folder>`; see the
 [chat_sft README](training_sessions_cookbook/recipes/chat_sft/README.md) for
 the checkpoint cadence options.
+
+## Deploy to SageMaker Inference
+
+Saved checkpoints can be deployed to
+[SageMaker real-time endpoints](https://docs.aws.amazon.com/sagemaker/latest/dg/realtime-endpoints-deploy-models.html).
+Since every checkpoint is a LoRA adapter over a shared base model, the natural
+fit is [adapter inference components](https://docs.aws.amazon.com/sagemaker/latest/dg/realtime-endpoints-adapt.html):
+host the base model once as an inference component and attach each fine-tune
+as an adapter component on the same endpoint.
+[`notebooks/deploy_to_sagemaker_inference.ipynb`](notebooks/deploy_to_sagemaker_inference.ipynb)
+demonstrates the full flow.
 
 ## MLflow publishing (optional)
 

@@ -511,6 +511,83 @@ class ServiceBackend:
         metrics.update(getattr(opt_result, "metrics", None) or {})
         return _ServiceTrainStepResult(raw=fb_result, metrics=metrics)
 
+    # --- streamed training (--fb_stream_chunks) -----------------------------
+    #
+    # The streaming protocol: the loop submits forward_backward sub-batches as
+    # rollout groups complete (fire-and-forget), then settles everything once
+    # via finish_train_step. Fire-and-forget matters: awaiting each sub-batch
+    # serially re-pays the dispatch round-trip per op (measured 4x256 datums:
+    # 47s awaited serially vs 23s submitted back-to-back), and would stall the
+    # rollout collector. Optional protocol - loops feature-detect via hasattr,
+    # so custom backends without it fall back to the monolithic train_step.
+
+    async def submit_forward_backward(self, datums: list[Any], *, loss_name: str) -> Any:
+        """Submit one forward_backward sub-batch; return its op WITHOUT waiting.
+
+        Gradients accumulate server-side across consecutive forward_backward
+        ops until optim_step applies them - the same mechanism the SDK's own
+        payload chunking relies on, and verified weight-equivalent to a single
+        monolithic call (chunked-vs-monolithic max weight delta 7.0e-5 vs a
+        6.7e-5 rerun-to-rerun noise floor).
+        """
+        loss_fn_config = build_loss_fn_config(self._args)
+        return await self._tc.forward_backward_async(
+            datums, loss_fn=self._loss_fn(loss_name), loss_fn_config=loss_fn_config
+        )
+
+    async def finish_train_step(
+        self,
+        fb_ops: list[Any],
+        *,
+        learning_rate: float,
+        beta1: float,
+        beta2: float,
+        eps: float,
+    ) -> Any:
+        """Submit optim_step after all streamed sub-batches, then await everything.
+
+        The single settle point of a streamed step: optim is sequenced AFTER
+        every submitted forward_backward (SDK sequence numbers preserve
+        submission order on the session), so the weight update sees the full
+        accumulated gradient - the on-policy barrier is unchanged.
+
+        Returns the same ``.metrics``-bearing result shape as
+        :meth:`train_step`; ``global_token_num`` is summed across sub-batches
+        (each op reports only its own tokens), other fb metrics are taken from
+        the last sub-batch, and optim metrics are merged over the top, exactly
+        as in the monolithic path.
+        """
+        assert fb_ops, "finish_train_step requires at least one submitted forward_backward"
+        AdamParams = self._t["AdamParams"]
+        adam_params = AdamParams(
+            learning_rate=learning_rate, beta1=beta1, beta2=beta2, eps=eps,
+        )
+        optim_op = await self._tc.optim_step_async(adam_params)
+
+        fb_results = []
+        for i, op in enumerate(fb_ops):
+            fb_results.append(await self._await_guarded(
+                asyncio.wait_for(op.result_async(), self._train_op_timeout),
+                what=f"forward_backward (streamed {i + 1}/{len(fb_ops)})",
+            ))
+        opt_result = await self._await_guarded(
+            asyncio.wait_for(optim_op.result_async(), self._train_op_timeout),
+            what="optim_step",
+        )
+
+        metrics = dict(getattr(fb_results[-1], "metrics", None) or {})
+        token_sum = 0.0
+        saw_tokens = False
+        for r in fb_results:
+            m = getattr(r, "metrics", None) or {}
+            if "global_token_num" in m:
+                token_sum += float(m["global_token_num"])
+                saw_tokens = True
+        if saw_tokens:
+            metrics["global_token_num"] = token_sum
+        metrics.update(getattr(opt_result, "metrics", None) or {})
+        return _ServiceTrainStepResult(raw=fb_results[-1], metrics=metrics)
+
     # --- checkpoint / deploy ----------------------------------------------
 
     @property

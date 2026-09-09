@@ -72,9 +72,13 @@ def add_console_echo_file(path: str) -> None:
     stream = open(key, "a", buffering=1, encoding="utf-8", errors="replace")
     console = None
     if _RICH_AVAILABLE:
-        # A file is not a terminal: rich emits no color/ANSI. Fixed width
-        # keeps table geometry stable regardless of the launching terminal.
-        console = _RichConsole(file=stream, width=100)
+        # force_terminal=False, explicitly: rich would otherwise honor
+        # FORCE_COLOR/CLICOLOR_FORCE over the file's non-tty status - Jupyter
+        # kernels set both, and a training launched from a notebook was
+        # writing raw ANSI into training.log. Fixed width keeps table
+        # geometry stable regardless of the launching terminal.
+        console = _RichConsole(file=stream, width=100, force_terminal=False,
+                               no_color=True)
     _echo_targets[key] = (stream, console)
 
 

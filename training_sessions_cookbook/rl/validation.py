@@ -157,8 +157,7 @@ class ValidationRunner:
                         num_samples=1,
                         sampling_params=sampling_params,
                     )
-                    # SageMaker training-session SDK response shape: `result.samples[i].tokens` / `.logprobs`.
-                    sequence = result.samples[0]
+                    sequence = result.sequences[0]
                     response_text = tokenizer.decode(list(sequence.tokens))
                 except SessionDeadError:
                     raise  # dead session: fail validation loudly, not per-prompt

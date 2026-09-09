@@ -190,7 +190,7 @@ def run_inference_comparison(
                 num_samples=1,
                 sampling_params=sampling_params,
             )
-            text = tokenizer.decode(response.samples[0].tokens, skip_special_tokens=True)
+            text = tokenizer.decode(response.sequences[0].tokens, skip_special_tokens=True)
             results.append({
                 "context": sample["context"],
                 "ground_truth": sample["ground_truth"],
@@ -209,7 +209,7 @@ def run_inference_comparison(
                 num_samples=1,
                 sampling_params=sampling_params,
             )
-            text = tokenizer.decode(response.samples[0].tokens, skip_special_tokens=True)
+            text = tokenizer.decode(response.sequences[0].tokens, skip_special_tokens=True)
             results[i]["finetuned_response"] = text
             print(f"  Fine-tuned: {i+1}/{len(samples)} done")
 

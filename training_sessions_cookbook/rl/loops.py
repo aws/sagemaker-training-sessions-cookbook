@@ -35,6 +35,7 @@ from .rollouts import (
     WrappedGroup,
     collect_batch_async,
     collect_grouped_batch_async,
+    collect_grouped_batch_streamed_async,
     collect_one_group_async,
 )
 from .runstate import run_artifacts
@@ -50,6 +51,56 @@ def compute_learning_rate(step: int, base_lr: float, warmup_steps: int) -> float
 
 # === Sampler refresh (lives in the backend) ===
 #
+class _FbStreamer:
+    """Accumulate completed rollout groups and stream fb sub-batches (sync loop).
+
+    Count-based trigger: after every ``ceil(n_groups / chunks)`` completed
+    groups, the accumulated transitions become one ``forward_backward``
+    submission (fire-and-forget - awaiting per sub-batch would re-pay the
+    dispatch round-trip serially and stall the collector). Advantages are
+    computed per group at completion, which is exactly equal to computing
+    them over the whole batch (grouped GRPO advantages are per-group by
+    construction). ``optim_step`` is NOT submitted here: the loop settles
+    everything once via ``backend.finish_train_step`` - the on-policy barrier.
+    """
+
+    def __init__(self, backend, args, n_groups: int, chunks: int):
+        self._backend = backend
+        self._args = args
+        self._chunk_groups = max(1, -(-n_groups // max(1, chunks)))
+        self._pending: list = []
+        self._groups_since_submit = 0
+        self.fb_ops: list = []
+        self.transitions: list = []
+
+    async def on_group(self, group) -> None:
+        transitions = compute_grouped_advantages([group])
+        self.transitions.extend(transitions)
+        self._pending.extend(transitions)
+        self._groups_since_submit += 1
+        if self._groups_since_submit >= self._chunk_groups:
+            await self._submit()
+
+    async def _submit(self) -> None:
+        self._groups_since_submit = 0
+        if not self._pending:
+            return  # every episode in the accumulated groups failed/was empty
+        datums = [
+            self._backend.build_datum(t, temperature=self._args.temperature)
+            for t in self._pending
+        ]
+        self._pending = []
+        self.fb_ops.append(
+            await self._backend.submit_forward_backward(
+                datums, loss_name=self._args.loss
+            )
+        )
+
+    async def flush(self) -> None:
+        """Submit whatever remains (the last, possibly short, sub-batch)."""
+        await self._submit()
+
+
 # The "save weights then (re)bind a sampling client" logic is backend-specific: ServiceBackend saves a non-merged checkpoint that auto-binds the sample path and reuses a *single* SamplingClient (see `backends/service.py`). The loop calls `backend.refresh_sampler(step)` and gets back the sampling client to roll out against, staying ignorant of the mechanism.
 
 
@@ -205,19 +256,57 @@ async def run_training(
             break
 
         # 3. Async rollouts + advantage computation. We keep the `episodes` view (a flat list of episodes) alongside the `transitions` view so episode-level metrics are computed on the right object.
+        # --fb_stream_chunks: overlap fb with sampling (grouped mode + a
+        # backend with the streaming protocol only; anything else falls back).
+        fb_streamer = None
+        _stream_n = int(cfg(args, "fb_stream_chunks") or 0)
+        if _stream_n > 0 and args.advantage_mode == "grouped":
+            if hasattr(backend, "submit_forward_backward") and hasattr(backend, "finish_train_step"):
+                fb_streamer = _FbStreamer(backend, args, len(prompts), _stream_n)
+            elif step == 0:
+                logging.getLogger(__name__).warning(
+                    "--fb_stream_chunks=%d ignored: backend %s has no streaming "
+                    "protocol (submit_forward_backward/finish_train_step); "
+                    "using the monolithic train_step.",
+                    _stream_n, type(backend).__name__)
+        elif _stream_n > 0 and step == 0:
+            logging.getLogger(__name__).warning(
+                "--fb_stream_chunks=%d ignored: requires --advantage_mode "
+                "grouped (monte_carlo/rebn normalizes across the whole batch).",
+                _stream_n)
+
         if args.advantage_mode == "grouped":
-            groups = await collect_grouped_batch_async(
-                prompts,
-                K=args.responses_per_prompt,
-                sampling_client=sampling_client,
-                args=args,
-                tokenizer=tokenizer,
-                env_factory=env_factory,
-                template_fn=template_fn,
-                backend=backend,
-            )
-            episodes = [episode for group in groups for episode in group]
-            transitions = compute_grouped_advantages(groups)
+            if fb_streamer is not None:
+                groups = await collect_grouped_batch_streamed_async(
+                    prompts,
+                    K=args.responses_per_prompt,
+                    sampling_client=sampling_client,
+                    args=args,
+                    tokenizer=tokenizer,
+                    env_factory=env_factory,
+                    template_fn=template_fn,
+                    backend=backend,
+                    on_group_complete=fb_streamer.on_group,
+                )
+                await fb_streamer.flush()
+                episodes = [episode for group in groups for episode in group]
+                # Advantages were already computed per group at completion
+                # (bitwise-identical to the batch computation); rebuild the
+                # prompt-ordered flat view for metrics/capture parity.
+                transitions = [t for g in groups for ep in g for t in ep]
+            else:
+                groups = await collect_grouped_batch_async(
+                    prompts,
+                    K=args.responses_per_prompt,
+                    sampling_client=sampling_client,
+                    args=args,
+                    tokenizer=tokenizer,
+                    env_factory=env_factory,
+                    template_fn=template_fn,
+                    backend=backend,
+                )
+                episodes = [episode for group in groups for episode in group]
+                transitions = compute_grouped_advantages(groups)
         else:  # monte_carlo
             episodes = await collect_batch_async(
                 prompts,
@@ -254,24 +343,35 @@ async def run_training(
         # Rollout capture: trajectories.jsonl and/or MLflow traces (opt-in).
         capture_rollouts(args, step, episodes, tokenizer, metrics_path)
 
-        # 5. Build datums via the backend (a PySDK datum dict). The rollout `Transition` is the shared interchange type.
-        datums = [
-            backend.build_datum(t, temperature=args.temperature)
-            for t in transitions
-        ]
-
-        # 6. Pipelined forward/backward + optimizer step, delegated to the backend. It submits both ops back-to-back and awaits in submission order so the optimizer kernel is scheduled as soon as gradients land (the service backend additionally saves weights here so the reused sampling client reflects the update). Returns fb_result (exposes `.metrics`).
+        # 5+6. Train. Streamed path: the sub-batch forward_backward ops were
+        # already submitted while rollouts were generating; settle them and the
+        # optimizer here (train_seconds then measures only the EXPOSED tail).
+        # Monolithic path: build all datums and run the pipelined
+        # fb+optim train_step exactly as before.
         train_start = time.time()
         # Compute effective LR with linear warmup.
         effective_lr = compute_learning_rate(step, args.learning_rate, warmup_steps)
-        fb_result = await backend.train_step(
-            datums,
-            loss_name=args.loss,
-            learning_rate=effective_lr,
-            beta1=adam_beta1,
-            beta2=adam_beta2,
-            eps=adam_epsilon,
-        )
+        if fb_streamer is not None and fb_streamer.fb_ops:
+            fb_result = await backend.finish_train_step(
+                fb_streamer.fb_ops,
+                learning_rate=effective_lr,
+                beta1=adam_beta1,
+                beta2=adam_beta2,
+                eps=adam_epsilon,
+            )
+        else:
+            datums = [
+                backend.build_datum(t, temperature=args.temperature)
+                for t in transitions
+            ]
+            fb_result = await backend.train_step(
+                datums,
+                loss_name=args.loss,
+                learning_rate=effective_lr,
+                beta1=adam_beta1,
+                beta2=adam_beta2,
+                eps=adam_epsilon,
+            )
         train_end = time.time()
         train_seconds = train_end - train_start
         step_total_seconds = train_end - step_start
@@ -384,6 +484,13 @@ async def run_training_async(
             thread_name_prefix="rollout-sample",
         )
     )
+    if int(cfg(args, "fb_stream_chunks") or 0) > 0:
+        # Default-on knob, so being >0 here is normal operation, not a
+        # misconfiguration: debug, not info.
+        log.debug(
+            "fb_stream_chunks=%s is a no-op in the off-by-k loop: rollout "
+            "collection already overlaps training here.",
+            cfg(args, "fb_stream_chunks"))
     log.info(
         "off-by-k loop: max_steps_off_policy=%d num_rollout_workers=%d "
         "batch_size(groups)=%d responses_per_prompt(K)=%d max_inflight_rollouts=%d",

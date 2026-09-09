@@ -136,6 +136,21 @@ def build_parser(
     mdl = parser.add_argument_group("model")
     mdl.add_argument("--base_model", required=True)
     mdl.add_argument("--lora_rank", type=int, default=32)
+
+    pipe = parser.add_argument_group("training pipeline")
+    pipe.add_argument(
+        "--fb_stream_chunks", type=int, default=default_knob("fb_stream_chunks"),
+        help="Overlap training with sampling in the on-policy loop: submit "
+             "forward_backward in N sub-batches as rollout groups complete, "
+             "instead of one call after the last rollout. Strictly on-policy "
+             "either way - forward_backward only accumulates gradients, and "
+             "optim_step (the weight update) still waits for every rollout "
+             "and every sub-batch. Requires --advantage_mode grouped (its "
+             "per-group advantages are batch-independent) and a backend with "
+             "the streaming protocol; otherwise falls back to the monolithic "
+             "path with a warning. Gains scale with how compute-heavy the "
+             "forward_backward is. Default 4; 0 = one monolithic call.",
+    )
     mdl.add_argument("--lora_alpha", type=int, default=64)
 
     # --- Service group ---------------------------------------------------

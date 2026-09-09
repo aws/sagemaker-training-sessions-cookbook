@@ -134,7 +134,7 @@ class _ValMockBackend:
 
     async def sample_async(self, sampling_client, prompt, *, num_samples=1, sampling_params=None):
         toks = self.tokenizer.encode("#### 42")
-        return SimpleNamespace(samples=[_Seq(toks)])
+        return SimpleNamespace(sequences=[_Seq(toks)])
 
 
 def _val_args():

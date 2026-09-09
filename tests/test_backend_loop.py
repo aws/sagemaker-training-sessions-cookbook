@@ -35,8 +35,8 @@ class _Seq:
 
 
 class _SampleResult:
-    def __init__(self, samples):
-        self.samples = samples
+    def __init__(self, sequences):
+        self.sequences = sequences
 
 
 class _FbResult:
