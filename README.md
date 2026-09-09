@@ -1,13 +1,13 @@
 # Training sessions cookbook
 
->Training recipes for **Amazon SageMaker AI serverless model customization** using **Training session APIs**.
+>Training recipes for **Amazon SageMaker AI serverless model customization** using **training session APIs**.
 
-This repo is a set of complete, runnable training loops built on Training session APIs.
+This repo is a set of complete, runnable training loops built on training session APIs.
 
-## About Training session APIs
+## About training session APIs
 Fine-tuning foundation models usually forces a tradeoff between control and operational simplicity. Managed fine-tuning services handle the infrastructure but limit you to a fixed set of techniques. Working at a lower level gives you algorithmic freedom but hands you the burden of GPU clusters, distributed training frameworks, and fault recovery.
 
-Training session APIs remove that tradeoff. A Training session is a live, GPU-backed session you drive from your own Python process: your loop decides each step while SageMaker AI handles the GPUs, base model loading, LoRA adapter registration, distributed execution, fault recovery, and checkpoint management. You define any training algorithm (supervised fine-tuning, reinforcement learning with custom reward functions, multi-stage pipelines, or entirely new techniques) and it runs on a stateful session where the model stays warm in memory across steps. Because the session is stateful, RL workflows can sample from the current policy without standing up a separate inference endpoint, and you can pause, inspect, and adjust training interactively.
+Training session APIs remove that tradeoff. A training session is a live, GPU-backed session you drive from your own Python process: your loop decides each step while SageMaker AI handles the GPUs, base model loading, LoRA adapter registration, distributed execution, fault recovery, and checkpoint management. You define any training algorithm (supervised fine-tuning, reinforcement learning with custom reward functions, multi-stage pipelines, or entirely new techniques) and it runs on a stateful session where the model stays warm in memory across steps. Because the session is stateful, RL workflows can sample from the current policy without standing up a separate inference endpoint, and you can pause, inspect, and adjust training interactively.
 
 ## How it works
 You write custom training logic in ordinary Python, on a notebook or your local machine, using three composable primitives:
@@ -20,8 +20,8 @@ The loss function is an argument to each training call: `cross_entropy` for supe
 
 ## Quickstart
 
-1. **Install**: Training Sessions support requires the `sagemaker-train`
-   package from PyPI, then install this package:
+1. **Install**: Training session APIs require the `sagemaker-train`
+   package from PyPI, which can be installed as shown below:
 
    ```bash
    python3 -m venv .venv && source .venv/bin/activate
@@ -29,7 +29,7 @@ The loss function is an argument to each training call: `cross_entropy` for supe
    pip install -e .
    ```
 
-   Or let the setup script do it (creates a conda env, installs the SDK, the
+   Or let the setup script handle it (creates a conda env, installs the SDK, the
    package, and all extras): `bash tools/setup_env.sh && conda activate cookbook`.
 
    Optional extras: `plots` (analysis scripts), `code-rl` (sandboxed code
