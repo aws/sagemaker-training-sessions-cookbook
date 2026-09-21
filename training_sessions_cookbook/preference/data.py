@@ -217,6 +217,35 @@ def kl_slice(ex: KtoExample):
     return _slice(ex.prompt_tokens, ex.kl_completion_tokens)
 
 
+def pair_slice(prompt_tokens, completion_tokens):
+    """``(input, target, completion_mask)`` for an arbitrary ``(prompt, completion)``.
+
+    Used for the ``compute_logprobs`` reference source, where the KL-partner
+    completion is re-drawn per step rather than fixed on the example.
+    """
+    return _slice(prompt_tokens, completion_tokens)
+
+
+def batch_kl_partners(batch: list["KtoExample"], rng) -> list[list[int]]:
+    """A within-batch derangement of completions for the KL term.
+
+    Returns, per example, *another* example's completion tokens (partner != self
+    when the batch has >1 example), so the KL reference point is estimated from
+    genuinely mismatched pairs. ``rng`` is a ``random.Random`` seeded per step,
+    so the pairing is re-randomized each step (TRL-style) when the reference is
+    scored on demand.
+    """
+    n = len(batch)
+    idx = list(range(n))
+    if n > 1:
+        rng.shuffle(idx)
+        for i in range(n):
+            if idx[i] == i:
+                j = (i + 1) % n
+                idx[i], idx[j] = idx[j], idx[i]
+    return [batch[idx[i]].completion_tokens for i in range(n)]
+
+
 def forward_datum(input_tokens, target_tokens, completion_mask) -> dict:
     """A forward-only datum: log-probs are read back for every target token.
 

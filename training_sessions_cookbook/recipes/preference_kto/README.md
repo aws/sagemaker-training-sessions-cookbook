@@ -77,11 +77,27 @@ dependence on the model is through per-sequence log-probs.
 
 ### Reference model
 
-The reference is the frozen base model (a LoRA adapter starts at zero delta), so
-the reference log-probs are computed **once before the first optimizer step**
-and cached to `{run_folder}/kto_reference.json`, which `--resume` reloads (after
-resuming, the adapter is no longer zero, so they cannot be recomputed on the
-fly).
+The reference is the frozen base model (a LoRA adapter starts at zero delta).
+`--reference_source` picks how its log-probs are obtained:
+
+- **`precompute`** (default): one training-forward pass at step 0 (while the
+  adapter delta is still zero, so the training client scores the base), cached
+  to `{run_folder}/kto_reference.json` and reloaded by `--resume` (after
+  resuming, the adapter is no longer zero, so they cannot be recomputed on the
+  fly). The KL pairing is fixed at build time so its reference side is
+  precomputable too.
+- **`compute_logprobs`**: score the frozen base **on demand** via an ARN-less
+  sampling client (`create_sampling_client()` with no checkpoint bound serves
+  the base model), so the KL pairing is re-randomized every step (TRL-style).
+  No reference cache is needed — the base client is always available.
+
+> **Engine-mismatch caveat.** The ARN-less client runs on the **inference**
+> engine, while the policy matched log-probs come from the **training** forward,
+> so the reward `r = logπ_θ(train) − logπ_ref(inference)` crosses two engines
+> (the rollout-vs-training log-prob gap). For KTO's `z_ref` — a detached, clamped
+> baseline — that is fine. The policy side of the reward is **never** taken from
+> the inference path, because the engine gap and the sampler-checkpoint lag would
+> bias the actual gradient.
 
 ### Cost
 
@@ -96,6 +112,7 @@ add a one-time pass over the dataset (two with the KL term) at startup.
 | `--beta` | `0.1` | temperature on the implicit reward; higher = sharper |
 | `--desirable_weight` / `--undesirable_weight` | `1.0` / `1.0` | class loss weights `λ_D` / `λ_U`; raise the minority class under imbalance |
 | `--kl_estimator` | `shuffled` | `shuffled` (faithful `z_ref`) or `none` (`z_ref = 0`, one fewer forward) |
+| `--reference_source` | `precompute` | `precompute` (step-0 forward, cached, fixed KL pairing) or `compute_logprobs` (score base on demand, re-randomized KL pairing) |
 | `--learning_rate` | `5e-6` | preference tuning wants a smaller LR than SFT |
 
 ## Checkpoints

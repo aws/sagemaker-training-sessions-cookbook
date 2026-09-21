@@ -286,3 +286,56 @@ def test_kto_step_with_kl_runs_extra_forward_and_positive_z_ref():
     # Matched forward + KL forward = two forward calls.
     assert client.forward_calls == [2, 2]
     assert metrics["kto/z_ref"] > 0.0
+
+
+class _MockBaseRefClient:
+    """ARN-less base client stub: returns a constant per-token log-prob.
+
+    ``compute_logprobs_async`` scores a full token sequence and returns one
+    value per token with the first element None (matching the real SDK).
+    """
+
+    def __init__(self, token_logprob=-1.0):
+        self.token_logprob = token_logprob
+        self.calls = 0
+
+    async def compute_logprobs_async(self, prompt=None):
+        self.calls += 1
+        toks = list(prompt)
+        return [None] + [self.token_logprob] * (len(toks) - 1)
+
+
+def test_score_reference_sums_masks_prompt_and_handles_leading_none():
+    ref = _MockBaseRefClient(token_logprob=-1.0)
+    # prompt len 3, completion len 2 -> sum of the 2 completion-position logprobs.
+    sums = asyncio.run(ktrain._score_reference_sums(
+        ref, [([10, 11, 12], [20, 21])], watchdog=NullWatchdog(), what="test"))
+    assert sums == [-2.0]  # two completion tokens at -1.0 each
+
+
+def test_kto_step_compute_logprobs_source_scores_base_and_rerandomizes_kl():
+    batch = [_example(label=True), _example(label=False)]
+    ref_matched = [-1.0, -1.0]
+    client = _MockClient(token_logprob=-0.5)      # policy: training forward
+    ref_client = _MockBaseRefClient(token_logprob=-3.0)  # reference: base client
+
+    metrics = asyncio.run(ktrain._kto_step(
+        _Args(), client, batch, ref_matched, None,
+        lr=1e-6, use_kl=True, sdk=_FakeSdk(), watchdog=NullWatchdog(),
+        reference_source="compute_logprobs", ref_client=ref_client, step_seed=1,
+    ))
+    # Policy matched + policy KL = two training forwards; the reference KL was
+    # scored on the base client (one call per example).
+    assert client.forward_calls == [2, 2]
+    assert ref_client.calls == 2
+    # Policy KL sum (-0.5/token) is well above the reference (-3.0/token), so
+    # z_ref = clamp(mean(policy - ref), 0) is strongly positive.
+    assert metrics["kto/z_ref"] > 0.0
+    # forward_backward + optim still run once with correct advantage signs.
+    assert client.optim_calls == 1
+
+    def _active_adv(datum):
+        return next(a for a in datum["lossFnInputs"]["advantages"]["data"] if a != 0.0)
+
+    assert _active_adv(client.fb_datums[0]) > 0.0   # desirable
+    assert _active_adv(client.fb_datums[1]) < 0.0   # undesirable

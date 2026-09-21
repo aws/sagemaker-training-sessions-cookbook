@@ -28,6 +28,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -46,10 +47,12 @@ from training_sessions_cookbook.service.session_watchdog import NullWatchdog, Se
 
 from .data import (
     KtoExample,
+    batch_kl_partners,
     build_kto_batches,
     forward_datum,
     kl_slice,
     matched_slice,
+    pair_slice,
     train_datum,
 )
 from .kto import advantage_from_grad, kl_reference_point, kto_term, sum_completion_logprob
@@ -124,6 +127,14 @@ def build_parser() -> argparse.ArgumentParser:
                         choices=["shuffled", "none"],
                         help="'shuffled': estimate z_ref from mismatched pairs "
                              "(one extra forward per step); 'none': z_ref = 0.")
+    parser.add_argument("--reference_source", type=str, default="precompute",
+                        choices=["precompute", "compute_logprobs"],
+                        help="Where reference (base-model) log-probs come from. "
+                             "'precompute': one training-forward pass at step 0 "
+                             "(LoRA delta still zero), cached; KL pairing fixed. "
+                             "'compute_logprobs': score the frozen base on demand "
+                             "via an ARN-less sampling client, re-randomizing the "
+                             "KL pairing every step (TRL-style).")
 
     # Training
     parser.add_argument("--learning_rate", type=float, default=5e-6)
@@ -201,6 +212,38 @@ async def _forward_logprobs(training_client, datums, *, loss_fn, watchdog, what)
     fwd_op = await training_client.forward_async(datums, loss_fn=loss_fn)
     result = await watchdog.guard(fwd_op.result_async(), what=what)
     return _extract_logprobs(result, len(datums))
+
+
+# === Reference scoring via an ARN-less base sampling client ==========
+#
+# CAVEAT (engine mismatch): the ARN-less sampling client runs on the INFERENCE
+# engine, while the policy matched log-probs come from the TRAINING forward. So
+# the reward r = log pi_theta(train) - log pi_ref(inference) crosses two engines
+# - the rollout-vs-training log-prob gap. For KTO's z_ref (a detached, clamped
+# baseline) that is fine. Do NOT use these inference-path log-probs for the
+# POLICY side of the reward, where the engine gap and the sampler checkpoint lag
+# would bias the actual gradient. The policy side always uses the training
+# forward (`_forward_logprobs`).
+
+
+async def _score_reference_sums(ref_client, pairs, *, watchdog, what):
+    """Sum frozen-base completion log-probs for ``(prompt, completion)`` pairs.
+
+    Uses the ARN-less sampling client's ``compute_logprobs_async`` (which serves
+    the base model), which returns one log-prob per token with the first element
+    ``None``. For ``full = prompt + completion``, the completion log-probs are
+    the entries at absolute positions ``[len(prompt) : len(prompt) + len(completion)]``,
+    so their sum is ``log pi_ref(completion | prompt)``. Requests are fired
+    concurrently so the inference server can batch-fuse them.
+    """
+    async def _one(prompt_tokens, completion_tokens):
+        full = list(prompt_tokens) + list(completion_tokens)
+        p, c = len(prompt_tokens), len(completion_tokens)
+        lps = await watchdog.guard(
+            ref_client.compute_logprobs_async(prompt=full), what=what)
+        return sum(x for x in lps[p : p + c] if x is not None)
+
+    return list(await asyncio.gather(*(_one(p, c) for p, c in pairs)))
 
 
 # === Reference log-probs (computed once, cached) ===
@@ -286,6 +329,7 @@ async def run_async(args, *, train_batches=None) -> None:
             "batch_size": args.batch_size,
             "beta": args.beta,
             "kl_estimator": args.kl_estimator,
+            "reference_source": args.reference_source,
             "learning_rate": args.learning_rate,
             "max_steps": args.max_steps if args.max_steps is not None else "one epoch",
             "run_folder": runlog.run_folder,
@@ -359,19 +403,47 @@ async def _train(args, session_name, runlog, svc, training_client, tokenizer,
         )
     logger.info("Dataset: %d batches of up to %d", n_batches, args.batch_size)
 
+    # --- Reference client (compute_logprobs source) ---------------------
+    # An ARN-less sampling client serves the frozen BASE model = the KTO
+    # reference. Created here, before any optim_step, so it unambiguously binds
+    # base weights. See the engine-mismatch CAVEAT above _score_reference_sums:
+    # these inference-path log-probs feed only the detached z_ref baseline and
+    # the reference side of the reward, never the policy gradient.
+    ref_client = None
+    if args.reference_source == "compute_logprobs":
+        ref_client = training_client.create_sampling_client()
+
     # --- Reference log-probs (frozen base model) ------------------------
-    # Computed once before any optim_step (LoRA delta is zero -> base model),
-    # then cached so a --resume run (adapter no longer zero) can reload them.
-    cached = _load_reference_cache(runlog.run_folder) if resume_record is not None else None
-    if cached is not None:
-        ref_matched, ref_kl = cached
-        logger.info("Loaded cached reference log-probs for %d batches", len(ref_matched))
+    if args.reference_source == "compute_logprobs":
+        # Score the base model on demand; matched references are frozen so we
+        # sum them once up front (recomputed cheaply on --resume - the base
+        # client is always available - so no disk cache is needed). KL
+        # references are re-randomized and scored per step (see _kto_step).
+        logger.info("Scoring reference (base-model) matched log-probs for %d batches "
+                    "via compute_logprobs", n_batches)
+        ref_matched = [
+            await _score_reference_sums(
+                ref_client,
+                [(e.prompt_tokens, e.completion_tokens) for e in batch],
+                watchdog=watchdog, what="reference scoring (matched)",
+            )
+            for batch in train_batches
+        ]
+        ref_kl = []  # unused: KL references are scored per step
     else:
-        logger.info("Computing reference (base-model) log-probs for %d batches%s",
-                    n_batches, " (+KL pairs)" if use_kl else "")
-        ref_matched, ref_kl = await _compute_reference_logprobs(
-            training_client, train_batches, use_kl=use_kl, sdk=sdk, watchdog=watchdog)
-        _save_reference_cache(runlog.run_folder, ref_matched, ref_kl)
+        # precompute source: one training-forward pass at step 0 (LoRA delta is
+        # zero -> base model), cached so a --resume run (adapter no longer zero)
+        # can reload them; the KL pairing is fixed on the example.
+        cached = _load_reference_cache(runlog.run_folder) if resume_record is not None else None
+        if cached is not None:
+            ref_matched, ref_kl = cached
+            logger.info("Loaded cached reference log-probs for %d batches", len(ref_matched))
+        else:
+            logger.info("Computing reference (base-model) log-probs for %d batches%s",
+                        n_batches, " (+KL pairs)" if use_kl else "")
+            ref_matched, ref_kl = await _compute_reference_logprobs(
+                training_client, train_batches, use_kl=use_kl, sdk=sdk, watchdog=watchdog)
+            _save_reference_cache(runlog.run_folder, ref_matched, ref_kl)
 
     # --- Step budget ----------------------------------------------------
     total_steps = n_batches * args.num_epochs
@@ -405,8 +477,11 @@ async def _train(args, session_name, runlog, svc, training_client, tokenizer,
 
             metrics = await _kto_step(
                 args, training_client, batch,
-                ref_matched[batch_idx], ref_kl[batch_idx] if use_kl else None,
+                ref_matched[batch_idx],
+                ref_kl[batch_idx] if (use_kl and args.reference_source == "precompute") else None,
                 lr=lr, use_kl=use_kl, sdk=sdk, watchdog=watchdog,
+                reference_source=args.reference_source, ref_client=ref_client,
+                step_seed=step,
             )
 
             elapsed = time.time() - t0
@@ -447,14 +522,21 @@ async def _train(args, session_name, runlog, svc, training_client, tokenizer,
 
 
 async def _kto_step(args, training_client, batch, ref_matched_sums, ref_kl_sums,
-                    *, lr, use_kl, sdk, watchdog) -> dict:
+                    *, lr, use_kl, sdk, watchdog,
+                    reference_source="precompute", ref_client=None, step_seed=0) -> dict:
     """One KTO step: two no-grad forwards -> advantages -> forward_backward + optim.
 
-    Returns the ``kto/*`` metrics for the step. ``ref_matched_sums`` /
-    ``ref_kl_sums`` are the precomputed reference completion log-prob sums for
-    this batch (``ref_kl_sums`` is ``None`` when the KL term is disabled).
+    Returns the ``kto/*`` metrics for the step. ``ref_matched_sums`` are the
+    precomputed reference completion log-prob sums for this batch. For the KL
+    term: with ``reference_source='precompute'`` the pairing is fixed and
+    ``ref_kl_sums`` supplies the reference side; with ``'compute_logprobs'`` the
+    pairing is re-randomized here and both sides are scored on the fly (reference
+    via the ARN-less ``ref_client`` - see the engine-mismatch CAVEAT above
+    ``_score_reference_sums``).
     """
     # 1. Policy log-probs on the matched pairs (per-token, for old_log_probs).
+    #    ALWAYS the training forward - never the inference-path ref_client -
+    #    because these drive the actual gradient (see CAVEAT).
     m_slices = [matched_slice(ex) for ex in batch]
     m_datums = [forward_datum(inp, tgt, mask) for inp, tgt, mask in m_slices]
     m_lps = await _forward_logprobs(training_client, m_datums, loss_fn=sdk.fwd_loss,
@@ -464,7 +546,25 @@ async def _kto_step(args, training_client, batch, ref_matched_sums, ref_kl_sums,
     ]
 
     # 2. KL reference point z_ref from the mismatched pairs (optional).
-    if use_kl:
+    if not use_kl:
+        z_ref = 0.0
+    elif reference_source == "compute_logprobs":
+        # Re-randomize the KL pairing this step, then score the policy (training
+        # forward) and the reference (base client) on the SAME mismatched pairs.
+        partners = batch_kl_partners(batch, random.Random(step_seed))
+        k_slices = [pair_slice(ex.prompt_tokens, comp) for ex, comp in zip(batch, partners)]
+        k_datums = [forward_datum(inp, tgt, mask) for inp, tgt, mask in k_slices]
+        k_lps = await _forward_logprobs(training_client, k_datums, loss_fn=sdk.fwd_loss,
+                                        watchdog=watchdog, what="policy forward (kl)")
+        policy_kl_sums = [
+            sum_completion_logprob(lp, mask) for lp, (_, _, mask) in zip(k_lps, k_slices)
+        ]
+        ref_kl_step = await _score_reference_sums(
+            ref_client, [(ex.prompt_tokens, comp) for ex, comp in zip(batch, partners)],
+            watchdog=watchdog, what="reference scoring (kl)")
+        z_ref = kl_reference_point(policy_kl_sums, ref_kl_step)
+    else:
+        # precompute source: fixed pairing on the example; reference precomputed.
         k_slices = [kl_slice(ex) for ex in batch]
         k_datums = [forward_datum(inp, tgt, mask) for inp, tgt, mask in k_slices]
         k_lps = await _forward_logprobs(training_client, k_datums, loss_fn=sdk.fwd_loss,
@@ -473,8 +573,6 @@ async def _kto_step(args, training_client, batch, ref_matched_sums, ref_kl_sums,
             sum_completion_logprob(lp, mask) for lp, (_, _, mask) in zip(k_lps, k_slices)
         ]
         z_ref = kl_reference_point(policy_kl_sums, ref_kl_sums)
-    else:
-        z_ref = 0.0
 
     # 3. Per-example KTO term -> per-token advantage (-s_i) -> train datum.
     train_datums = []
