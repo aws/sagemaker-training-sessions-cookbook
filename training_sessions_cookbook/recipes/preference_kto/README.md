@@ -29,6 +29,9 @@ python -m training_sessions_cookbook.recipes.preference_kto.train \
     --config training_sessions_cookbook/recipes/preference_kto/configs/kto_mix.json
 ```
 
+Launcher: [`examples/kto_mix.sh`](../../../examples/kto_mix.sh) (sources `.env`
+for account ARNs; optional MLflow publishing).
+
 The dataset needs `prompt` / `completion` / `label` columns (the
 `trl-lib/kto-mix-*` shape); a local `.jsonl` with the same keys also works
 (`label` truthy = desirable). Prompt and completion may each be a chat-message
