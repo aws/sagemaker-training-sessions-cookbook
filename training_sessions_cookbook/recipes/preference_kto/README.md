@@ -42,12 +42,41 @@ list or a bare string.
 | `kto/reward_desirable` | mean `log pi_theta - log pi_ref` on desirable | rising |
 | `kto/reward_undesirable` | same on undesirable | falling |
 | `kto/reward_margin` | desirable minus undesirable reward | widening (> 0) |
+| `kto/logps_desirable` / `kto/logps_undesirable` | mean completion log-prob per class (TRL's `logps/chosen`, `logps/rejected`) | steady — a crash signals collapse |
 | `kto/accuracy` | fraction on the correct side of `z_ref` | rising toward 1 |
 | `kto/z_ref` | KL reference point | small, stable |
 
-A widening `kto/reward_margin` with a stable `kto/z_ref` is the signal that the
-model is learning to prefer desirable completions without drifting far from the
-reference.
+Every `--eval_every` steps a **held-out** pass adds `kto/eval_reward_margin`,
+`kto/eval_accuracy`, `kto/eval_reward_desirable` / `_undesirable`, and
+`kto/eval_logps_desirable` / `_undesirable` to that step's record (forward-only,
+using the step's `z_ref` as the accuracy threshold). The held-out
+`kto/eval_reward_margin` is the metric to trust for whether KTO is actually
+helping — training margins can widen while the model degrades.
+
+A widening `kto/reward_margin` (train **and** eval) with a stable `kto/z_ref`
+and non-collapsing `kto/logps_*` is the signal that the model is learning to
+prefer desirable completions without drifting far from the reference. If
+`kto/logps_desirable` falls sharply, the model is degrading generations — lower
+the learning rate or `--beta`.
+
+## Expected results
+
+Assessed on `trl-lib/kto-mix-14k` with an instruct base model. Absolute values
+depend on the model and data; what matters is the **direction** over training:
+
+| Metric | Start | Healthy trend |
+|---|---|---|
+| `kto/eval_reward_margin` | ~0 | rises and stays > 0 |
+| `kto/eval_accuracy` | ~0.5 | rises toward 0.7–0.9 |
+| `kto/z_ref` | small | stays small and stable (no runaway KL) |
+| `kto/eval_logps_desirable` | — | does **not** collapse |
+
+> Fill this table with measured numbers from a reference run on your setup;
+> they are model- and data-dependent, so no fixed targets are quoted here. For a
+> downstream check beyond these preference metrics, evaluate win-rate vs the
+> reference model (model-judged) or a standard instruction benchmark on the
+> saved adapter — those measure whether the alignment transferred to generation
+> quality, which the reward metrics only proxy.
 
 ## How the loop works
 
@@ -113,7 +142,8 @@ add a one-time pass over the dataset (two with the KL term) at startup.
 | `--desirable_weight` / `--undesirable_weight` | `1.0` / `1.0` | class loss weights `λ_D` / `λ_U`; raise the minority class under imbalance |
 | `--kl_estimator` | `shuffled` | `shuffled` (faithful `z_ref`) or `none` (`z_ref = 0`, one fewer forward) |
 | `--reference_source` | `precompute` | `precompute` (step-0 forward, cached, fixed KL pairing) or `compute_logprobs` (score base on demand, re-randomized KL pairing) |
-| `--learning_rate` | `5e-6` | preference tuning wants a smaller LR than SFT |
+| `--eval_every` | `50` | held-out eval pass cadence in steps (`0` disables); split sized by `--eval_size` / `--eval_ratio` |
+| `--learning_rate` | `5e-6` | preference tuning wants a smaller LR than SFT; TRL recommends `5e-7`–`5e-6` at `beta=0.1` |
 
 ## Checkpoints
 

@@ -265,10 +265,11 @@ def test_kto_step_sets_advantage_sign_by_label_and_runs_fb_optim():
     # old_log_probs equal the forward log-probs (ratio 1 at evaluation).
     assert all(x == -0.5 for x in client.fb_datums[0]["lossFnInputs"]["logprobs"]["data"])
 
-    # Metrics surface the KTO diagnostics.
+    # Metrics surface the KTO diagnostics, including per-class log-probs.
     assert metrics["kto/frac_desirable"] == 0.5
     assert metrics["kto/z_ref"] == 0.0
     assert "kto/loss" in metrics and "kto/reward_margin" in metrics
+    assert "kto/logps_desirable" in metrics and "kto/logps_undesirable" in metrics
     # KL disabled -> only the matched forward ran (one call), plus fb.
     assert client.forward_calls == [2]
 
@@ -339,3 +340,23 @@ def test_kto_step_compute_logprobs_source_scores_base_and_rerandomizes_kl():
 
     assert _active_adv(client.fb_datums[0]) > 0.0   # desirable
     assert _active_adv(client.fb_datums[1]) < 0.0   # undesirable
+
+
+def test_evaluate_kto_returns_held_out_metrics():
+    # One eval batch: a desirable and an undesirable example. Reference sums are
+    # set so the desirable reward is large-positive and the undesirable small,
+    # giving a positive margin and perfect accuracy at z_ref = 0.
+    eval_batches = [[_example(label=True), _example(label=False)]]
+    eval_ref_matched = [[-100.0, -1.0]]
+    client = _MockClient(token_logprob=-0.5)
+
+    metrics = asyncio.run(ktrain._evaluate_kto(
+        client, eval_batches, eval_ref_matched,
+        z_ref=0.0, sdk=_FakeSdk(), watchdog=NullWatchdog()))
+
+    assert metrics["kto/eval_num_examples"] == 2
+    assert metrics["kto/eval_reward_margin"] > 0.0
+    assert metrics["kto/eval_accuracy"] == 1.0
+    assert "kto/eval_logps_desirable" in metrics
+    # Forward-only: no optimizer step was taken during eval.
+    assert client.optim_calls == 0

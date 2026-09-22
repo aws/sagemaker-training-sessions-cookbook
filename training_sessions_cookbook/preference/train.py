@@ -148,6 +148,10 @@ def build_parser() -> argparse.ArgumentParser:
                              "{log_path}/checkpoints.jsonl (reuses the cached "
                              "reference log-probs; requires --log_path).")
     parser.add_argument("--log_every", type=int, default=10)
+    parser.add_argument("--eval_every", type=int, default=50,
+                        help="Run a held-out eval pass every N steps (0 = off). "
+                             "Uses the eval split carved out by --eval_size / "
+                             "--eval_ratio.")
     parser.add_argument("--lr_schedule", type=str, default="linear",
                         choices=["linear", "cosine", "constant"])
     parser.add_argument("--warmup_steps", type=int, default=0)
@@ -287,18 +291,83 @@ async def _compute_reference_logprobs(training_client, batches, *, use_kl, sdk, 
     return ref_matched, ref_kl
 
 
+async def _matched_reference_sums(batches, *, source, training_client, ref_client,
+                                  sdk, watchdog, label):
+    """Reference completion log-prob sums for the matched pairs of each batch.
+
+    Works for both reference sources: ``precompute`` scores via a training
+    forward (valid only before the first optim_step, when the LoRA delta is
+    zero); ``compute_logprobs`` scores the frozen base on demand via the
+    ARN-less client. Returns a per-batch list of per-example scalar sums.
+    """
+    out: list[list[float]] = []
+    for bi, batch in enumerate(batches):
+        what = f"reference {label} ({bi + 1}/{len(batches)})"
+        if source == "compute_logprobs":
+            sums = await _score_reference_sums(
+                ref_client, [(e.prompt_tokens, e.completion_tokens) for e in batch],
+                watchdog=watchdog, what=what)
+        else:
+            slices = [matched_slice(e) for e in batch]
+            datums = [forward_datum(inp, tgt, mask) for inp, tgt, mask in slices]
+            lps = await _forward_logprobs(training_client, datums, loss_fn=sdk.fwd_loss,
+                                          watchdog=watchdog, what=what)
+            sums = [sum_completion_logprob(lp, mask) for lp, (_, _, mask) in zip(lps, slices)]
+        out.append(sums)
+    return out
+
+
+async def _evaluate_kto(training_client, eval_batches, eval_ref_matched, *,
+                        z_ref, sdk, watchdog) -> dict:
+    """Held-out KTO diagnostics: reward margin, accuracy, and per-class log-probs.
+
+    Forward-only (no gradient). Rewards are ``logπ_θ − logπ_ref`` on the eval
+    completions; ``accuracy`` uses the current training ``z_ref`` as the
+    threshold (desirable above it, undesirable below). ``reward_margin`` needs
+    no threshold and is the headline held-out number.
+    """
+    rewards_d, rewards_u, logps_d, logps_u, correct, total = [], [], [], [], 0, 0
+    for bi, (batch, ref_sums) in enumerate(zip(eval_batches, eval_ref_matched)):
+        slices = [matched_slice(ex) for ex in batch]
+        datums = [forward_datum(inp, tgt, mask) for inp, tgt, mask in slices]
+        lps = await _forward_logprobs(training_client, datums, loss_fn=sdk.fwd_loss,
+                                      watchdog=watchdog,
+                                      what=f"eval forward ({bi + 1}/{len(eval_batches)})")
+        for ex, (_, _, mask), lp, ref_sum in zip(batch, slices, lps, ref_sums):
+            policy_sum = sum_completion_logprob(lp, mask)
+            reward = policy_sum - ref_sum
+            (rewards_d if ex.label else rewards_u).append(reward)
+            (logps_d if ex.label else logps_u).append(policy_sum)
+            if (ex.label and reward > z_ref) or (not ex.label and reward < z_ref):
+                correct += 1
+            total += 1
+
+    mean = lambda xs: (sum(xs) / len(xs)) if xs else float("nan")
+    return {
+        "kto/eval_reward_desirable": mean(rewards_d),
+        "kto/eval_reward_undesirable": mean(rewards_u),
+        "kto/eval_reward_margin": (mean(rewards_d) - mean(rewards_u))
+        if rewards_d and rewards_u else float("nan"),
+        "kto/eval_logps_desirable": mean(logps_d),
+        "kto/eval_logps_undesirable": mean(logps_u),
+        "kto/eval_accuracy": correct / total if total else float("nan"),
+        "kto/eval_num_examples": total,
+    }
+
+
 def _load_reference_cache(run_folder: str):
     path = _reference_cache_path(run_folder)
     if not os.path.exists(path):
         return None
     with open(path) as f:
         cached = json.load(f)
-    return cached.get("matched", []), cached.get("kl", [])
+    return cached.get("matched", []), cached.get("kl", []), cached.get("eval_matched", [])
 
 
-def _save_reference_cache(run_folder: str, ref_matched, ref_kl) -> None:
+def _save_reference_cache(run_folder: str, ref_matched, ref_kl, eval_ref_matched) -> None:
     with open(_reference_cache_path(run_folder), "w") as f:
-        json.dump({"matched": ref_matched, "kl": ref_kl}, f)
+        json.dump({"matched": ref_matched, "kl": ref_kl,
+                   "eval_matched": eval_ref_matched}, f)
 
 
 # === Run ===
@@ -403,6 +472,19 @@ async def _train(args, session_name, runlog, svc, training_client, tokenizer,
         )
     logger.info("Dataset: %d batches of up to %d", n_batches, args.batch_size)
 
+    # --- Eval dataset ---------------------------------------------------
+    # Held-out split (carved from train by --eval_size / --eval_ratio) for the
+    # periodic eval pass. Built only when --eval_every > 0; empty disables eval.
+    eval_batches = []
+    if args.eval_every > 0:
+        eval_batches = build_kto_batches(
+            dataset_path=args.dataset_path, tokenizer=tokenizer,
+            batch_size=args.batch_size, max_length=args.max_length, split="eval",
+            eval_size=args.eval_size, eval_ratio=args.eval_ratio,
+            max_rows=args.max_rows, hf_split_name=args.eval_split,
+        )
+        logger.info("Eval dataset: %d batches", len(eval_batches))
+
     # --- Reference client (compute_logprobs source) ---------------------
     # An ARN-less sampling client serves the frozen BASE model = the KTO
     # reference. Created here, before any optim_step, so it unambiguously binds
@@ -414,36 +496,39 @@ async def _train(args, session_name, runlog, svc, training_client, tokenizer,
         ref_client = training_client.create_sampling_client()
 
     # --- Reference log-probs (frozen base model) ------------------------
+    # Matched references (train + eval) are frozen; the KL references depend on
+    # the source (precompute: fixed pairing, cached; compute_logprobs: scored
+    # per step). Everything here runs before the first optim_step.
     if args.reference_source == "compute_logprobs":
-        # Score the base model on demand; matched references are frozen so we
-        # sum them once up front (recomputed cheaply on --resume - the base
-        # client is always available - so no disk cache is needed). KL
-        # references are re-randomized and scored per step (see _kto_step).
-        logger.info("Scoring reference (base-model) matched log-probs for %d batches "
-                    "via compute_logprobs", n_batches)
-        ref_matched = [
-            await _score_reference_sums(
-                ref_client,
-                [(e.prompt_tokens, e.completion_tokens) for e in batch],
-                watchdog=watchdog, what="reference scoring (matched)",
-            )
-            for batch in train_batches
-        ]
+        # Score the base model on demand (recomputed cheaply on --resume, so no
+        # disk cache is needed). KL references are re-randomized per step.
+        logger.info("Scoring reference matched log-probs via compute_logprobs "
+                    "(%d train + %d eval batches)", n_batches, len(eval_batches))
+        ref_matched = await _matched_reference_sums(
+            train_batches, source="compute_logprobs", training_client=training_client,
+            ref_client=ref_client, sdk=sdk, watchdog=watchdog, label="matched (train)")
+        eval_ref_matched = await _matched_reference_sums(
+            eval_batches, source="compute_logprobs", training_client=training_client,
+            ref_client=ref_client, sdk=sdk, watchdog=watchdog, label="matched (eval)")
         ref_kl = []  # unused: KL references are scored per step
     else:
-        # precompute source: one training-forward pass at step 0 (LoRA delta is
+        # precompute source: training-forward passes at step 0 (LoRA delta is
         # zero -> base model), cached so a --resume run (adapter no longer zero)
         # can reload them; the KL pairing is fixed on the example.
         cached = _load_reference_cache(runlog.run_folder) if resume_record is not None else None
         if cached is not None:
-            ref_matched, ref_kl = cached
+            ref_matched, ref_kl, eval_ref_matched = cached
             logger.info("Loaded cached reference log-probs for %d batches", len(ref_matched))
         else:
-            logger.info("Computing reference (base-model) log-probs for %d batches%s",
-                        n_batches, " (+KL pairs)" if use_kl else "")
+            logger.info("Computing reference (base-model) log-probs for %d train batches%s "
+                        "+ %d eval batches", n_batches,
+                        " (+KL pairs)" if use_kl else "", len(eval_batches))
             ref_matched, ref_kl = await _compute_reference_logprobs(
                 training_client, train_batches, use_kl=use_kl, sdk=sdk, watchdog=watchdog)
-            _save_reference_cache(runlog.run_folder, ref_matched, ref_kl)
+            eval_ref_matched = await _matched_reference_sums(
+                eval_batches, source="precompute", training_client=training_client,
+                ref_client=None, sdk=sdk, watchdog=watchdog, label="matched (eval)")
+            _save_reference_cache(runlog.run_folder, ref_matched, ref_kl, eval_ref_matched)
 
     # --- Step budget ----------------------------------------------------
     total_steps = n_batches * args.num_epochs
@@ -501,6 +586,18 @@ async def _train(args, session_name, runlog, svc, training_client, tokenizer,
                 metrics.get("kto/reward_margin", float("nan")),
                 metrics.get("kto/z_ref", float("nan")), lr, elapsed,
             )
+
+            # Held-out eval on cadence; merged into this step's record. Uses the
+            # step's training z_ref as the accuracy threshold (reward_margin
+            # needs none). Forward-only, so it never perturbs the weights.
+            if eval_batches and args.eval_every > 0 and step % args.eval_every == 0:
+                eval_metrics = await _evaluate_kto(
+                    training_client, eval_batches, eval_ref_matched,
+                    z_ref=metrics.get("kto/z_ref", 0.0), sdk=sdk, watchdog=watchdog)
+                metrics.update(eval_metrics)
+                logger.info("  eval reward_margin=%.4f accuracy=%.4f",
+                            eval_metrics.get("kto/eval_reward_margin", float("nan")),
+                            eval_metrics.get("kto/eval_accuracy", float("nan")))
 
             runlog.log_metrics(metrics, step=step)
             display_step = step + 1
@@ -576,7 +673,7 @@ async def _kto_step(args, training_client, batch, ref_matched_sums, ref_kl_sums,
 
     # 3. Per-example KTO term -> per-token advantage (-s_i) -> train datum.
     train_datums = []
-    losses, rewards_d, rewards_u, correct = [], [], [], 0
+    losses, rewards_d, rewards_u, logps_d, logps_u, correct = [], [], [], [], [], 0
     for ex, (inp, tgt, mask), policy_sum, ref_sum, per_token in zip(
         batch, m_slices, policy_matched_sums, ref_matched_sums, m_lps
     ):
@@ -590,6 +687,9 @@ async def _kto_step(args, training_client, batch, ref_matched_sums, ref_kl_sums,
                                         old_logprobs=per_token))
         losses.append(term.loss)
         (rewards_d if ex.label else rewards_u).append(term.reward)
+        # Mean completion log-prob by class (TRL's logps/chosen, logps/rejected):
+        # a crashing value here is the earliest sign the policy is collapsing.
+        (logps_d if ex.label else logps_u).append(policy_sum)
         # "Correct" = desirable reward above z_ref, undesirable below it.
         if (ex.label and term.reward > z_ref) or (not ex.label and term.reward < z_ref):
             correct += 1
@@ -609,6 +709,8 @@ async def _kto_step(args, training_client, batch, ref_matched_sums, ref_kl_sums,
         "kto/reward_desirable": mean(rewards_d),
         "kto/reward_undesirable": mean(rewards_u),
         "kto/reward_margin": mean(rewards_d) - mean(rewards_u) if rewards_d and rewards_u else float("nan"),
+        "kto/logps_desirable": mean(logps_d),
+        "kto/logps_undesirable": mean(logps_u),
         "kto/accuracy": correct / len(batch),
         "kto/frac_desirable": len(rewards_d) / len(batch),
     }

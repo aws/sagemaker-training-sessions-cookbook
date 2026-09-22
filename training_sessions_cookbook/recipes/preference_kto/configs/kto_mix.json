@@ -18,6 +18,8 @@
   "max_steps": 400,
   "save_every": 100,
   "log_every": 10,
+  "eval_every": 50,
+  "eval_ratio": 0.05,
   "lr_schedule": "linear",
   "warmup_steps": 20,
   "adam_beta1": 0.9,
