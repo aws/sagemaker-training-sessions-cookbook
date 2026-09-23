@@ -18,7 +18,7 @@ fi
 
 # SageMaker configuration: override via env for your account.
 export TRAINING_SESSION_NAME="${TRAINING_SESSION_NAME:-kto-mix-$(date +%s)}"
-export BASE_MODEL_ARN="${BASE_MODEL_ARN:-arn:aws:sagemaker:us-west-2:aws:hub-content/SageMakerPublicHub/Model/huggingface-vlm-qwen3-6-27b/1.8.0}"
+export BASE_MODEL_ARN="${BASE_MODEL_ARN:-arn:aws:sagemaker:us-west-2:aws:hub-content/SageMakerPublicHub/Model/huggingface-vlm-qwen3-6-27b/1.23.0}"
 export MODEL_PACKAGE_GROUP_ARN="${MODEL_PACKAGE_GROUP_ARN:-arn:aws:sagemaker:us-west-2:ACCOUNT_ID:model-package-group/cookbook-preference}"
 export ROLE_ARN="${ROLE_ARN:-arn:aws:iam::ACCOUNT_ID:role/SageMakerRole}"
 export OUTPUT_S3_PATH="${OUTPUT_S3_PATH:-s3://YOUR_BUCKET/training-sessions-cookbook/kto-output/kto-mix}"
@@ -60,6 +60,7 @@ python -m training_sessions_cookbook.recipes.preference_kto.train \
     --save_every=100 \
     --eval_every=50 \
     --eval_ratio=0.05 \
+    --eval_size=320 \
     --lr_schedule=linear \
     --log_path="$RESULTS_DIR" \
     "${MLFLOW_ARGS[@]}" \

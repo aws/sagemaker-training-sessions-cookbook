@@ -266,4 +266,12 @@ class RunLog:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
+        # Record the crash cause in training.log BEFORE close() detaches the
+        # file handler: unhandled exceptions otherwise reach only stderr (the
+        # interpreter's excepthook), leaving the run folder's log ending at
+        # the session-cleanup lines with no hint of why the run died. Logging
+        # first also puts the traceback into the artifact that close() uploads.
+        # KeyboardInterrupt is a deliberate stop, not a crash to explain.
+        if exc_type is not None and not issubclass(exc_type, KeyboardInterrupt):
+            logger.error("Run failed: %s", exc, exc_info=(exc_type, exc, tb))
         self.close("FAILED" if exc_type is not None else "FINISHED")

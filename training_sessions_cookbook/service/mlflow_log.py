@@ -204,6 +204,25 @@ class MlflowPublisher:
             "MLflow publishing enabled: tracking_uri=%s experiment=%s run_name=%s run_id=%s",
             tracking_uri, experiment_name, run_name, publisher.run_id,
         )
+        # Log the UI URLs through the logging system so they land in
+        # training.log. The mlflow library prints its own "View run at:"
+        # banner via raw print() at end_run(), which bypasses logging AND
+        # happens after RunLog.close() has already detached the file handler
+        # -- so without this line the run folder carries no clickable link.
+        try:
+            if tracking_uri.startswith("arn:"):
+                # SageMaker managed MLflow: the UI lives on the regional app
+                # domain, not the ARN (which mlflow.get_tracking_uri() returns).
+                region = tracking_uri.split(":")[3]
+                ui_base = f"https://mlflow.sagemaker.{region}.app.aws"
+            else:
+                ui_base = tracking_uri.rstrip("/")
+            exp_id = run.info.experiment_id
+            logger.info("MLflow run UI: %s/#/experiments/%s/runs/%s",
+                        ui_base, exp_id, run.info.run_id)
+            logger.info("MLflow experiment UI: %s/#/experiments/%s", ui_base, exp_id)
+        except Exception:  # never let a cosmetic log line fail the sink
+            pass
         if config:
             publisher.log_params(config)
         return publisher

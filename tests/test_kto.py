@@ -223,13 +223,39 @@ class _Args:
     adam_eps = 1e-8
 
 
+def _dm(n):
+    """A datum stub with an n-token model input."""
+    return {"modelInput": {"chunks": [{"tokens": list(range(n))}]}}
+
+
 def test_extract_logprobs_reads_per_token_and_validates_shape():
+    # Per-datum shape (future engines): one entry per datum, used directly.
     result = _Result(loss_fn_outputs=[{"logprobs": {"data": [-1.0, -2.0]}}])
-    assert ktrain._extract_logprobs(result, 1) == [[-1.0, -2.0]]
+    assert ktrain._extract_logprobs(result, [_dm(2)]) == [[-1.0, -2.0]]
+
+    # Flat shape (current engines): one entry, len(input)+1 values per datum,
+    # split by input length and trimmed front-aligned.
+    flat = _Result(loss_fn_outputs=[
+        {"logprobs": {"data": [-1.0, -2.0, -99.0, -3.0, -4.0, -5.0, -98.0]}}])
+    assert ktrain._extract_logprobs(flat, [_dm(2), _dm(3)]) == [
+        [-1.0, -2.0], [-3.0, -4.0, -5.0]]
+
+    # Flat shape without the appended extra position also partitions.
+    flat0 = _Result(loss_fn_outputs=[{"logprobs": {"data": [-1.0, -2.0, -3.0]}}])
+    assert ktrain._extract_logprobs(flat0, [_dm(2), _dm(1)]) == [[-1.0, -2.0], [-3.0]]
+
+    # A flat tensor that fits neither partition is rejected.
+    bad = _Result(loss_fn_outputs=[{"logprobs": {"data": [-1.0, -2.0]}}])
+    try:
+        ktrain._extract_logprobs(bad, [_dm(2), _dm(3)])
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("expected RuntimeError for non-partitionable flat tensor")
 
     missing = _Result(loss_fn_outputs=[{"actor/loss": 0.5}])
     try:
-        ktrain._extract_logprobs(missing, 1)
+        ktrain._extract_logprobs(missing, [_dm(1)])
     except RuntimeError:
         pass
     else:
