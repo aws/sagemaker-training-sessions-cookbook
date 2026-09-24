@@ -93,16 +93,26 @@ def load_preference_rows(
 
         ds = datasets.load_dataset(dataset_path)
         if isinstance(ds, datasets.DatasetDict):
-            if hf_split_name and hf_split_name in ds:
-                hf_split = ds[hf_split_name]
-                if split == "train":
-                    hf_split = hf_split.shuffle(seed=0)
-            elif split in ds:
-                hf_split = ds[split]
-                if split == "train":
-                    hf_split = hf_split.shuffle(seed=0)
+            pool_name = (
+                hf_split_name if hf_split_name and hf_split_name in ds else "train"
+            )
+            held_out = next(
+                (n for n in ("eval", "validation", "test") if n in ds and n != pool_name),
+                None,
+            )
+            if held_out is not None:
+                # Dedicated held-out split: eval uses it (capped by eval_size),
+                # train keeps the full pool.
+                if split == "eval":
+                    hf_split = ds[held_out].shuffle(seed=0)
+                    if eval_size is not None and eval_size < len(hf_split):
+                        hf_split = hf_split.select(range(eval_size))
+                else:
+                    hf_split = ds[pool_name].shuffle(seed=0)
             else:
-                full = ds["train"].shuffle(seed=0)
+                # No held-out split: carve eval = head, train = tail from one
+                # shuffle, so the two sides stay disjoint.
+                full = ds[pool_name].shuffle(seed=0)
                 n_eval = _eval_count(len(full))
                 hf_split = (
                     full.select(range(n_eval))

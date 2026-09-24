@@ -182,40 +182,71 @@ def parse_args(argv=None):
 # === Service helpers ===
 
 
-def _extract_logprobs(result, num_datums: int) -> list[list[float]]:
+def _datum_input_len(datum: dict) -> int:
+    """Token count of a datum's model input (== len(targets) == len(mask))."""
+    return sum(len(c["tokens"]) for c in datum["modelInput"]["chunks"])
+
+
+def _entry_logprobs(entry) -> list[float]:
+    """The 'logprobs' tensor of one loss_fn_outputs entry, as a flat float list."""
+    lp = entry.get("logprobs") if isinstance(entry, dict) else None
+    if lp is None:
+        raise RuntimeError(
+            "forward result has no per-token 'logprobs'. KTO needs the "
+            "service's per-token log-prob output; update sagemaker-train to a "
+            "version whose forward returns 'logprobs'."
+        )
+    data = lp["data"] if isinstance(lp, dict) else lp
+    return [float(x) for x in data]
+
+
+def _extract_logprobs(result, datums: list[dict]) -> list[list[float]]:
     """Pull per-token log-probs out of a forward result, one list per datum.
 
-    Expects ``result.loss_fn_outputs`` to be a per-datum list whose entries
-    carry a ``logprobs`` tensor (TensorData dict or a raw list). Raises a clear
-    error if the service did not return per-token log-probs (an older SDK that
-    only returns the reduced ``actor/loss`` cannot drive KTO this way).
+    The engine returns ``loss_fn_outputs`` as a single flat entry today: one
+    ``logprobs`` tensor with all sequences concatenated, ``len(input) + 1``
+    values per datum (the datum adapter appends the final target token), no
+    padding. This splits it back per datum by input length and trims each
+    slice to ``len(targets)``, front-aligned. If the engine returns one entry
+    per datum (the documented future shape), that is used directly.
     """
     lfo = getattr(result, "loss_fn_outputs", None)
     entries = lfo if isinstance(lfo, list) else ([lfo] if lfo else [])
-    if len(entries) != num_datums:
+    lens = [_datum_input_len(d) for d in datums]
+
+    if len(entries) == len(datums):
+        # Per-datum shape (future engines) — trim any appended extra position.
+        return [_entry_logprobs(e)[:n] for e, n in zip(entries, lens)]
+
+    if len(entries) == 1:
+        flat = _entry_logprobs(entries[0])
+        # Current engines: len(input)+1 logprobs per datum. Accept len(input)
+        # too in case the appended position is ever dropped.
+        for extra in (1, 0):
+            if sum(n + extra for n in lens) == len(flat):
+                out, offset = [], 0
+                for n in lens:
+                    out.append(flat[offset:offset + n])
+                    offset += n + extra
+                return out
         raise RuntimeError(
-            f"forward returned {len(entries)} loss_fn_outputs for {num_datums} "
-            "datums; expected one per datum with per-token 'logprobs'."
+            f"forward returned one flat loss_fn_outputs entry with {len(flat)} "
+            f"logprobs, which does not partition into {len(datums)} datums of "
+            f"input lengths {lens} (+0 or +1 each)."
         )
-    out: list[list[float]] = []
-    for entry in entries:
-        lp = entry.get("logprobs") if isinstance(entry, dict) else None
-        if lp is None:
-            raise RuntimeError(
-                "forward result has no per-token 'logprobs'. KTO needs the "
-                "SDK's per-token log-prob output; update sagemaker-train to a "
-                "version whose forward returns 'logprobs'."
-            )
-        data = lp["data"] if isinstance(lp, dict) else lp
-        out.append([float(x) for x in data])
-    return out
+
+    raise RuntimeError(
+        f"forward returned {len(entries)} loss_fn_outputs for {len(datums)} "
+        "datums; expected one flat entry or one per datum with per-token "
+        "'logprobs'."
+    )
 
 
 async def _forward_logprobs(training_client, datums, *, loss_fn, watchdog, what):
     """Run a no-grad forward and return per-datum per-token log-probs."""
     fwd_op = await training_client.forward_async(datums, loss_fn=loss_fn)
     result = await watchdog.guard(fwd_op.result_async(), what=what)
-    return _extract_logprobs(result, len(datums))
+    return _extract_logprobs(result, datums)
 
 
 # === Reference scoring via an ARN-less base sampling client ==========
@@ -318,15 +349,21 @@ async def _matched_reference_sums(batches, *, source, training_client, ref_clien
 
 
 async def _evaluate_kto(training_client, eval_batches, eval_ref_matched, *,
-                        z_ref, sdk, watchdog) -> dict:
+                        z_ref, sdk, watchdog, step=None, run_folder=None,
+                        tokenizer=None, examples_per_eval=8) -> dict:
     """Held-out KTO diagnostics: reward margin, accuracy, and per-class log-probs.
 
     Forward-only (no gradient). Rewards are ``logπ_θ − logπ_ref`` on the eval
     completions; ``accuracy`` uses the current training ``z_ref`` as the
     threshold (desirable above it, undesirable below). ``reward_margin`` needs
     no threshold and is the headline held-out number.
+
+    When ``run_folder`` and ``tokenizer`` are given, the first
+    ``examples_per_eval`` examples of each pass are appended to
+    ``validation_examples.jsonl`` with their decoded text and rewards.
     """
     rewards_d, rewards_u, logps_d, logps_u, correct, total = [], [], [], [], 0, 0
+    records = []
     for bi, (batch, ref_sums) in enumerate(zip(eval_batches, eval_ref_matched)):
         slices = [matched_slice(ex) for ex in batch]
         datums = [forward_datum(inp, tgt, mask) for inp, tgt, mask in slices]
@@ -341,6 +378,20 @@ async def _evaluate_kto(training_client, eval_batches, eval_ref_matched, *,
             if (ex.label and reward > z_ref) or (not ex.label and reward < z_ref):
                 correct += 1
             total += 1
+            if tokenizer is not None and len(records) < examples_per_eval:
+                records.append({
+                    "step": step,
+                    "prompt": tokenizer.decode(ex.prompt_tokens),
+                    "completion": tokenizer.decode(ex.completion_tokens),
+                    "label": "desirable" if ex.label else "undesirable",
+                    "logp_policy": round(policy_sum, 3),
+                    "logp_ref": round(ref_sum, 3),
+                    "reward": round(reward, 3),
+                })
+    if run_folder is not None and records:
+        with open(os.path.join(run_folder, "validation_examples.jsonl"), "a") as f:
+            for r in records:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
     mean = lambda xs: (sum(xs) / len(xs)) if xs else float("nan")
     return {
@@ -560,7 +611,7 @@ async def _train(args, session_name, runlog, svc, training_client, tokenizer,
                                schedule=args.lr_schedule, warmup_steps=args.warmup_steps)
             batch: list[KtoExample] = train_batches[batch_idx]
 
-            metrics = await _kto_step(
+            step_metrics = await _kto_step(
                 args, training_client, batch,
                 ref_matched[batch_idx],
                 ref_kl[batch_idx] if (use_kl and args.reference_source == "precompute") else None,
@@ -570,14 +621,16 @@ async def _train(args, session_name, runlog, svc, training_client, tokenizer,
             )
 
             elapsed = time.time() - t0
-            metrics.update({
+            # Identity keys first so metrics.jsonl records read step-first.
+            metrics = {
                 "step": step,
                 "epoch": epoch,
                 "progress": (step + 1) / total_steps,
+                **step_metrics,
                 "config/learning_rate": lr,
                 "train/num_examples": len(batch),
                 "time/step_total_seconds": round(elapsed, 2),
-            })
+            }
 
             logger.info(
                 "step=%d/%d epoch=%d kto/loss=%.4f reward_margin=%.4f z_ref=%.4f lr=%.2e time=%.1fs",
@@ -593,7 +646,8 @@ async def _train(args, session_name, runlog, svc, training_client, tokenizer,
             if eval_batches and args.eval_every > 0 and step % args.eval_every == 0:
                 eval_metrics = await _evaluate_kto(
                     training_client, eval_batches, eval_ref_matched,
-                    z_ref=metrics.get("kto/z_ref", 0.0), sdk=sdk, watchdog=watchdog)
+                    z_ref=metrics.get("kto/z_ref", 0.0), sdk=sdk, watchdog=watchdog,
+                    step=step, run_folder=runlog.run_folder, tokenizer=tokenizer)
                 metrics.update(eval_metrics)
                 logger.info("  eval reward_margin=%.4f accuracy=%.4f",
                             eval_metrics.get("kto/eval_reward_margin", float("nan")),

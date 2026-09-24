@@ -54,7 +54,10 @@ Every `--eval_every` steps a **held-out** pass adds `kto/eval_reward_margin`,
 `kto/eval_logps_desirable` / `_undesirable` to that step's record (forward-only,
 using the step's `z_ref` as the accuracy threshold). The held-out
 `kto/eval_reward_margin` is the metric to trust for whether KTO is actually
-helping — training margins can widen while the model degrades.
+helping — training margins can widen while the model degrades. The preset trains
+for 300 steps: a 400-step reference run showed every metric plateaued by step
+~300 (eval margin and accuracy flat from there on). On other datasets, stop
+once `kto/eval_reward_margin` is flat across two consecutive eval passes.
 
 A widening `kto/reward_margin` (train **and** eval) with a stable `kto/z_ref`
 and non-collapsing `kto/logps_*` is the signal that the model is learning to
@@ -67,15 +70,18 @@ the learning rate or `--beta`.
 Assessed on `trl-lib/kto-mix-14k` with an instruct base model. Absolute values
 depend on the model and data; what matters is the **direction** over training:
 
-| Metric | Start | Healthy trend |
-|---|---|---|
-| `kto/eval_reward_margin` | ~0 | rises and stays > 0 |
-| `kto/eval_accuracy` | ~0.5 | rises toward 0.7–0.9 |
-| `kto/z_ref` | small | stays small and stable (no runaway KL) |
-| `kto/eval_logps_desirable` | — | does **not** collapse |
+| Metric | Start | Healthy trend | Reference run (400 steps) |
+|---|---|---|---|
+| `kto/eval_reward_margin` | ~0 | rises and stays > 0 | -0.1 → ~98 |
+| `kto/eval_accuracy` | ~0.5 | rises toward 0.7–0.9 | 0.47 → 0.69 |
+| `kto/z_ref` | small | stays small and stable (no runaway KL) | 0 throughout |
+| `kto/eval_logps_desirable` | — | does **not** collapse | -333 → -354 |
 
-> Fill this table with measured numbers from a reference run on your setup;
-> they are model- and data-dependent, so no fixed targets are quoted here. For a
+Reference run: `configs/kto_mix.json` on qwen3.6-27b; metrics and plots in
+[`results/preference_kto/`](../../../results/preference_kto/)
+(regenerate with `python -m training_sessions_cookbook.recipes.preference_kto.plots`).
+
+> For a
 > downstream check beyond these preference metrics, evaluate win-rate vs the
 > reference model (model-judged) or a standard instruction benchmark on the
 > saved adapter — those measure whether the alignment transferred to generation
@@ -143,7 +149,7 @@ add a one-time pass over the dataset (two with the KL term) at startup.
 |---|---|---|
 | `--beta` | `0.1` | temperature on the implicit reward; higher = sharper |
 | `--desirable_weight` / `--undesirable_weight` | `1.0` / `1.0` | class loss weights `λ_D` / `λ_U`; raise the minority class under imbalance |
-| `--kl_estimator` | `shuffled` | `shuffled` (faithful `z_ref`) or `none` (`z_ref = 0`, one fewer forward) |
+| `--kl_estimator` | `shuffled` | `shuffled` (faithful `z_ref`) or `none` (`z_ref = 0`, one fewer forward). In the reference run `z_ref` stayed 0 throughout — if you see the same, `none` is free |
 | `--reference_source` | `precompute` | `precompute` (step-0 forward, cached, fixed KL pairing) or `compute_logprobs` (score base on demand, re-randomized KL pairing) |
 | `--eval_every` | `50` | held-out eval pass cadence in steps (`0` disables); split sized by `--eval_size` / `--eval_ratio` |
 | `--learning_rate` | `5e-6` | preference tuning wants a smaller LR than SFT; TRL recommends `5e-7`–`5e-6` at `beta=0.1` |
