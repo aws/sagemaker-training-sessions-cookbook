@@ -386,3 +386,46 @@ def test_evaluate_kto_returns_held_out_metrics():
     assert "kto/eval_logps_desirable" in metrics
     # Forward-only: no optimizer step was taken during eval.
     assert client.optim_calls == 0
+
+
+def test_evaluate_kto_writes_validation_examples(tmp_path):
+    import asyncio, json
+    from training_sessions_cookbook.preference.data import KtoExample
+
+    class _Tok:
+        def decode(self, toks):
+            return f"<{len(toks)} toks>"
+
+    class _SDK:
+        fwd_loss = "cross_entropy"
+
+    class _Watchdog:
+        async def guard(self, coro, what=""):
+            return await coro
+
+    ex_d = KtoExample(prompt_tokens=[1, 2], completion_tokens=[3, 4], label=True,
+                      kl_completion_tokens=[5, 6])
+    ex_u = KtoExample(prompt_tokens=[1, 2], completion_tokens=[7, 8], label=False,
+                      kl_completion_tokens=[5, 6])
+
+    class _Client:
+        async def forward_async(self, datums, loss_fn):
+            async def _result():
+                n = sum(len(d["modelInput"]["chunks"][0]["tokens"]) + 1 for d in datums)
+                return _Result(loss_fn_outputs=[{"logprobs": {"data": [-1.0] * n}}])
+            class _Op:
+                def result_async(self):
+                    return _result()
+            return _Op()
+
+    metrics = asyncio.run(ktrain._evaluate_kto(
+        _Client(), [[ex_d, ex_u]], [[-5.0, -1.0]],
+        z_ref=0.0, sdk=_SDK(), watchdog=_Watchdog(),
+        step=7, run_folder=str(tmp_path), tokenizer=_Tok()))
+
+    lines = [json.loads(l) for l in open(tmp_path / "validation_examples.jsonl")]
+    assert len(lines) == 2
+    assert lines[0]["step"] == 7
+    assert {l["label"] for l in lines} == {"desirable", "undesirable"}
+    assert all("reward" in l and "prompt" in l for l in lines)
+    assert metrics["kto/eval_num_examples"] == 2

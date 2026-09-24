@@ -70,8 +70,19 @@ def _train_eval_panel(ax, steps, train_raw, ev_steps, ev_vals, *, window, ylabel
     _style(ax)
 
 
+def _run_beta(metrics_path: str) -> float | None:
+    """beta from the config.json beside the metrics, if present."""
+    cfg = os.path.join(os.path.dirname(os.path.abspath(metrics_path)), "config.json")
+    try:
+        with open(cfg) as f:
+            return float(json.load(f).get("beta"))
+    except (OSError, TypeError, ValueError):
+        return None
+
+
 def plot_kto_run(metrics_path: str, output_dir: str, window: int = 10) -> list[str]:
     records = [json.loads(line) for line in open(metrics_path)]
+    beta = _run_beta(metrics_path)
     steps = [r["step"] for r in records]
     evals = [r for r in records if "kto/eval_reward_margin" in r]
     ev_steps = [r["step"] for r in evals]
@@ -97,12 +108,21 @@ def plot_kto_run(metrics_path: str, output_dir: str, window: int = 10) -> list[s
     ax1.legend(frameon=False)
     _style(ax1)
 
+    # Plot the margin beta-scaled (TRL logs rewards as beta*log-ratio, so this
+    # is the scale to compare against TRL charts); raw log-ratio on the right.
+    scale = beta if beta else 1.0
     _train_eval_panel(
-        ax2, steps, series("kto/reward_margin"),
-        ev_steps, eval_series("kto/eval_reward_margin"),
-        window=window, ylabel="reward margin (nats per completion)",
+        ax2, steps, [scale * v for v in series("kto/reward_margin")],
+        ev_steps, [scale * v for v in eval_series("kto/eval_reward_margin")],
+        window=window,
+        ylabel=(f"reward margin, beta-scaled (TRL convention, beta={beta:g})"
+                if beta else "reward margin (raw log-ratio, nats per completion)"),
         baseline=0, baseline_label="0 (no separation)", show_raw=False)
     ax2.set_title("Implicit reward margin: desirable \u2212 undesirable")
+    if beta:
+        ax2r = ax2.secondary_yaxis(
+            "right", functions=(lambda v: v / beta, lambda v: v * beta))
+        ax2r.set_ylabel("raw log-ratio (nats per completion)")
     fig.tight_layout()
     path = os.path.join(output_dir, "learning.png")
     fig.savefig(path, dpi=150, bbox_inches="tight")

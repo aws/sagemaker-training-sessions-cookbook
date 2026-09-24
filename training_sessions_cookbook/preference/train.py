@@ -349,15 +349,21 @@ async def _matched_reference_sums(batches, *, source, training_client, ref_clien
 
 
 async def _evaluate_kto(training_client, eval_batches, eval_ref_matched, *,
-                        z_ref, sdk, watchdog) -> dict:
+                        z_ref, sdk, watchdog, step=None, run_folder=None,
+                        tokenizer=None, examples_per_eval=8) -> dict:
     """Held-out KTO diagnostics: reward margin, accuracy, and per-class log-probs.
 
     Forward-only (no gradient). Rewards are ``logπ_θ − logπ_ref`` on the eval
     completions; ``accuracy`` uses the current training ``z_ref`` as the
     threshold (desirable above it, undesirable below). ``reward_margin`` needs
     no threshold and is the headline held-out number.
+
+    When ``run_folder`` and ``tokenizer`` are given, the first
+    ``examples_per_eval`` examples of each pass are appended to
+    ``validation_examples.jsonl`` with their decoded text and rewards.
     """
     rewards_d, rewards_u, logps_d, logps_u, correct, total = [], [], [], [], 0, 0
+    records = []
     for bi, (batch, ref_sums) in enumerate(zip(eval_batches, eval_ref_matched)):
         slices = [matched_slice(ex) for ex in batch]
         datums = [forward_datum(inp, tgt, mask) for inp, tgt, mask in slices]
@@ -372,6 +378,20 @@ async def _evaluate_kto(training_client, eval_batches, eval_ref_matched, *,
             if (ex.label and reward > z_ref) or (not ex.label and reward < z_ref):
                 correct += 1
             total += 1
+            if tokenizer is not None and len(records) < examples_per_eval:
+                records.append({
+                    "step": step,
+                    "prompt": tokenizer.decode(ex.prompt_tokens),
+                    "completion": tokenizer.decode(ex.completion_tokens),
+                    "label": "desirable" if ex.label else "undesirable",
+                    "logp_policy": round(policy_sum, 3),
+                    "logp_ref": round(ref_sum, 3),
+                    "reward": round(reward, 3),
+                })
+    if run_folder is not None and records:
+        with open(os.path.join(run_folder, "validation_examples.jsonl"), "a") as f:
+            for r in records:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
     mean = lambda xs: (sum(xs) / len(xs)) if xs else float("nan")
     return {
@@ -626,7 +646,8 @@ async def _train(args, session_name, runlog, svc, training_client, tokenizer,
             if eval_batches and args.eval_every > 0 and step % args.eval_every == 0:
                 eval_metrics = await _evaluate_kto(
                     training_client, eval_batches, eval_ref_matched,
-                    z_ref=metrics.get("kto/z_ref", 0.0), sdk=sdk, watchdog=watchdog)
+                    z_ref=metrics.get("kto/z_ref", 0.0), sdk=sdk, watchdog=watchdog,
+                    step=step, run_folder=runlog.run_folder, tokenizer=tokenizer)
                 metrics.update(eval_metrics)
                 logger.info("  eval reward_margin=%.4f accuracy=%.4f",
                             eval_metrics.get("kto/eval_reward_margin", float("nan")),
