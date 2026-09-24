@@ -54,9 +54,10 @@ Every `--eval_every` steps a **held-out** pass adds `kto/eval_reward_margin`,
 `kto/eval_logps_desirable` / `_undesirable` to that step's record (forward-only,
 using the step's `z_ref` as the accuracy threshold). The held-out
 `kto/eval_reward_margin` is the metric to trust for whether KTO is actually
-helping — training margins can widen while the model degrades. In the reference
-run every metric plateaued by step ~300 of 400; stop the run once
-`kto/eval_reward_margin` is flat across two consecutive eval passes.
+helping — training margins can widen while the model degrades. The preset trains
+for 300 steps: a 400-step reference run showed every metric plateaued by step
+~300 (eval margin and accuracy flat from there on). On other datasets, stop
+once `kto/eval_reward_margin` is flat across two consecutive eval passes.
 
 A widening `kto/reward_margin` (train **and** eval) with a stable `kto/z_ref`
 and non-collapsing `kto/logps_*` is the signal that the model is learning to

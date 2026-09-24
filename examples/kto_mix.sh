@@ -55,7 +55,7 @@ python -m training_sessions_cookbook.recipes.preference_kto.train \
     --batch_size=32 \
     --max_length=4096 \
     --num_epochs=1 \
-    --max_steps=400 \
+    --max_steps=300 \
     --warmup_steps=20 \
     --save_every=100 \
     --eval_every=50 \

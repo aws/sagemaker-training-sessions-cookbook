@@ -15,7 +15,7 @@
   "kl_estimator": "shuffled",
   "learning_rate": 5e-06,
   "num_epochs": 1,
-  "max_steps": 400,
+  "max_steps": 300,
   "save_every": 100,
   "log_every": 10,
   "eval_every": 50,
