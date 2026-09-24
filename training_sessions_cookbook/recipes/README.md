@@ -8,6 +8,7 @@ same way: `python -m training_sessions_cookbook.recipes.<name>.train`.
 | [`chat_sft/`](chat_sft/) | Supervised fine-tuning on chat datasets | `sft/` |
 | [`gsm8k_rl/`](gsm8k_rl/) | RL on grade-school math (GSM8K) | `rl/` |
 | [`code_rl/`](code_rl/) | RL on competitive programming, sandbox-graded | `rl/` |
+| [`preference_kto/`](preference_kto/) | KTO preference alignment from binary labels | `preference/` |
 
 Every run writes `{run_folder}/metrics.jsonl` (one line per step) and
 `{run_folder}/checkpoints.jsonl` (the model-package ARN of every saved

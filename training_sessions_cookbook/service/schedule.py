@@ -14,11 +14,17 @@ _MIN_MULTIPLIER = 1e-8
 
 
 def warmup_factor(step: int, warmup_steps: int) -> float:
-    """Linear warmup ramp in [0, 1]; 1.0 when ``warmup_steps <= 0``."""
+    """Linear warmup ramp in (0, 1]; 1.0 when ``warmup_steps <= 0``.
+
+    Ramps as ``(step + 1) / warmup_steps`` so step 0 gets a small positive LR
+    rather than exactly zero — the service rejects ``learningRate <= 0``, so a
+    zero first step would fail the run (and locally it would just waste the
+    first batch).
+    """
     if warmup_steps <= 0:
         return 1.0
-    if step < warmup_steps:
-        return step / warmup_steps
+    if step + 1 < warmup_steps:
+        return (step + 1) / warmup_steps
     return 1.0
 
 

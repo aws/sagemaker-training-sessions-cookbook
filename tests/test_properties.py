@@ -99,7 +99,11 @@ class TestProperty2LinearWarmupLearningRate:
     """Linear Warmup Learning Rate Schedule.
 
 
-    For any base_lr > 0, warmup_steps > 0, and step in [0, warmup_steps), compute_learning_rate(step, base_lr, warmup_steps) SHALL equal (step / warmup_steps) * base_lr. For any step >= warmup_steps, it SHALL equal base_lr.
+    For any base_lr > 0 and warmup_steps > 0, compute_learning_rate SHALL ramp
+    as ((step + 1) / warmup_steps) * base_lr while step + 1 < warmup_steps, and
+    equal base_lr from step + 1 >= warmup_steps on. The +1 keeps step 0 at a
+    small positive LR: the service rejects learningRate <= 0, so a ramp that
+    starts at exactly zero fails the run's first optim_step.
     """
 
     @given(
@@ -109,11 +113,12 @@ class TestProperty2LinearWarmupLearningRate:
     )
     @settings(max_examples=100)
     def test_warmup_phase_lr_equals_linear_interpolation(self, step, base_lr, warmup_steps):
-        """During warmup (step < warmup_steps), LR = (step / warmup_steps) * base_lr."""
-        assume(step < warmup_steps)
+        """During warmup (step + 1 < warmup_steps), LR = ((step + 1) / warmup_steps) * base_lr."""
+        assume(step + 1 < warmup_steps)
 
         result = compute_learning_rate(step, base_lr, warmup_steps)
-        expected = (step / warmup_steps) * base_lr
+        expected = ((step + 1) / warmup_steps) * base_lr
+        assert result > 0, "warmup LR must be strictly positive (service rejects lr <= 0)"
 
         assert math.isclose(result, expected, rel_tol=1e-9), (
             f"step={step}, base_lr={base_lr}, warmup_steps={warmup_steps}: "
