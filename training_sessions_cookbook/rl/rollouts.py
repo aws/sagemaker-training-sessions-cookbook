@@ -58,7 +58,7 @@ from .envs.gsm8k import (  # noqa: F401  # re-exported for callers
 class Transition:
     """One turn of one rollout episode.
 
-    `obs_tokens` captures the running prompt + history tokens at this turn; `act_tokens` / `act_logprobs` are the sampled assistant tokens and the per-token logprobs returned by the sampler. `advantage` is populated later by the advantage helpers (`compute_monte_carlo_advantages` / `compute_grouped_advantages`); it defaults to `0.0` so freshly-built transitions are immediately consumable by `build_training_datum` even before advantages are filled in.
+    `obs_tokens` captures the running prompt + history tokens at this turn; `act_tokens` / `act_logprobs` are the sampled assistant tokens and the per-token logprobs returned by the sampler. `advantage` is populated later by the advantage helpers (`compute_monte_carlo_advantages` / `compute_grouped_advantages`, or a distillation advantage function, which writes a per-token list); it defaults to `0.0` so freshly-built transitions are immediately consumable by `build_training_datum` even before advantages are filled in.
     """
 
     obs_tokens: list[int]
@@ -67,7 +67,14 @@ class Transition:
     reward: float
     done: bool
     env_type: str
-    advantage: float = 0.0
+    #: A scalar (broadcast over every action token, the RL default) or a
+    #: per-token list aligned with ``act_tokens`` (on-policy distillation).
+    advantage: "float | list[float]" = 0.0
+    #: Rollout context for advantage functions that need more than tokens:
+    #: ``prompt`` (the dataset row), ``observation`` / ``tools`` (the first
+    #: env observation, before templating), and ``step_info`` (the env's info
+    #: dict for this turn). ``None`` on transitions built outside a rollout.
+    info: "Optional[dict]" = None
 
 
 @dataclass
@@ -179,7 +186,7 @@ async def rollout_one(
 
         # Env speaks plain text, not tokens. Decode for env.step().
         action_text = tokenizer.decode(act_tokens)
-        next_obs, reward, terminated, truncated, _step_info = env.step(action_text)
+        next_obs, reward, terminated, truncated, step_info = env.step(action_text)
         done = bool(terminated or truncated)
 
         transitions.append(
@@ -190,6 +197,12 @@ async def rollout_one(
                 reward=float(reward),
                 done=done,
                 env_type=env_type,
+                info={
+                    "prompt": prompt,
+                    "observation": observation,
+                    "tools": None,
+                    "step_info": step_info,
+                },
             )
         )
 
@@ -297,7 +310,7 @@ async def rollout_one_code(
             return []
 
         action_text = tokenizer.decode(act_tokens)
-        next_obs, reward, terminated, truncated, _step_info = await env.step_async(
+        next_obs, reward, terminated, truncated, step_info = await env.step_async(
             action_text
         )
         done = bool(terminated or truncated)
@@ -310,6 +323,12 @@ async def rollout_one_code(
                 reward=float(reward),
                 done=done,
                 env_type=env_type,
+                info={
+                    "prompt": prompt,
+                    "observation": observation,
+                    "tools": tools,
+                    "step_info": step_info,
+                },
             )
         )
 

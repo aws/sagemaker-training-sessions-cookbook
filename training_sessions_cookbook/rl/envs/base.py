@@ -19,7 +19,14 @@ class Transition:
     reward: float
     done: bool
     env_type: str
-    advantage: float = 0.0
+    #: A scalar (broadcast over every action token, the RL default) or a
+    #: per-token list aligned with ``act_tokens`` (on-policy distillation).
+    advantage: "float | list[float]" = 0.0
+    #: Rollout context for advantage functions that need more than tokens:
+    #: ``prompt`` (the dataset row), ``observation`` / ``tools`` (the first
+    #: env observation, before templating), and ``step_info`` (the env's info
+    #: dict for this turn). ``None`` on transitions built outside a rollout.
+    info: "Optional[dict]" = None
 
 
 @dataclass

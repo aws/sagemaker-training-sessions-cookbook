@@ -49,6 +49,34 @@ def compute_learning_rate(step: int, base_lr: float, warmup_steps: int) -> float
     return _learning_rate(base_lr, step, warmup_steps=warmup_steps)
 
 
+# === Pluggable advantage function ===
+#
+# Grouped-mode advantages default to GRPO (``compute_grouped_advantages``). A
+# caller can replace that stage with ``advantage_fn``, an async callable
+#
+#     await advantage_fn(groups, *, step, sampling_client) -> list[Transition]
+#
+# that receives one or more completed K-episode groups and returns their
+# transitions with ``advantage`` populated (a scalar, or a per-token list
+# aligned with ``act_tokens``). ``sampling_client`` is the client the groups
+# were sampled from. On-policy distillation uses this seam to score each
+# rollout under a teacher (``training_sessions_cookbook.distill``). If the
+# object also has ``pop_step_metrics() -> dict``, the loop merges those into
+# the step's metrics record. It is called per group when forward_backward is
+# streamed, so it must not normalize across groups.
+
+
+async def _grouped_advantages(advantage_fn, groups, *, step, sampling_client):
+    if advantage_fn is None:
+        return compute_grouped_advantages(groups)
+    return await advantage_fn(groups, step=step, sampling_client=sampling_client)
+
+
+def _advantage_fn_metrics(advantage_fn) -> dict:
+    pop = getattr(advantage_fn, "pop_step_metrics", None)
+    return dict(pop() or {}) if pop is not None else {}
+
+
 # === Sampler refresh (lives in the backend) ===
 #
 class _FbStreamer:
@@ -64,9 +92,13 @@ class _FbStreamer:
     everything once via ``backend.finish_train_step`` - the on-policy barrier.
     """
 
-    def __init__(self, backend, args, n_groups: int, chunks: int):
+    def __init__(self, backend, args, n_groups: int, chunks: int, *,
+                 advantage_fn=None, step: int = 0, sampling_client=None):
         self._backend = backend
         self._args = args
+        self._advantage_fn = advantage_fn
+        self._step = step
+        self._sampling_client = sampling_client
         self._chunk_groups = max(1, -(-n_groups // max(1, chunks)))
         self._pending: list = []
         self._groups_since_submit = 0
@@ -74,7 +106,10 @@ class _FbStreamer:
         self.transitions: list = []
 
     async def on_group(self, group) -> None:
-        transitions = compute_grouped_advantages([group])
+        transitions = await _grouped_advantages(
+            self._advantage_fn, [group],
+            step=self._step, sampling_client=self._sampling_client,
+        )
         self.transitions.extend(transitions)
         self._pending.extend(transitions)
         self._groups_since_submit += 1
@@ -138,6 +173,7 @@ async def run_training(
     template_fn,
     validation_runner=None,
     checkpoint_manager=None,
+    advantage_fn=None,
 ) -> int:
     """Drive the per-step RL training loop against the backend.
 
@@ -150,7 +186,13 @@ async def run_training(
         tokenizer: Tokenizer obtained from the backend's training client; consumed by `rollout_one` for `.encode` / `.decode`.
         env_factory: Zero-arg callable returning a fresh `GSM8KMultiTurnEnv`. One env is constructed per concurrent rollout because the env is stateful.
         template_fn: Unary `(observation: str) -> str` template function; `main()` resolves `--template` against `TEMPLATE_FACTORY` and binds `apply_auto` against `args.base_model` before passing it through.
+        advantage_fn: Optional replacement for the grouped GRPO advantage stage (see "Pluggable advantage function" above). Requires `--advantage_mode grouped`.
     """
+    if advantage_fn is not None and args.advantage_mode != "grouped":
+        raise SystemExit(
+            "a custom advantage_fn requires --advantage_mode grouped "
+            "(it replaces the grouped advantage stage)"
+        )
     # Enlarge the event loop's default thread pool so blocking
     # `sampling_client.sample()` calls (dispatched via `asyncio.to_thread`) can
     # actually run `--num_rollout_workers`-wide. The implicit default executor
@@ -262,7 +304,11 @@ async def run_training(
         _stream_n = int(cfg(args, "fb_stream_chunks") or 0)
         if _stream_n > 0 and args.advantage_mode == "grouped":
             if hasattr(backend, "submit_forward_backward") and hasattr(backend, "finish_train_step"):
-                fb_streamer = _FbStreamer(backend, args, len(prompts), _stream_n)
+                fb_streamer = _FbStreamer(
+                    backend, args, len(prompts), _stream_n,
+                    advantage_fn=advantage_fn, step=step,
+                    sampling_client=sampling_client,
+                )
             elif step == 0:
                 logging.getLogger(__name__).warning(
                     "--fb_stream_chunks=%d ignored: backend %s has no streaming "
@@ -306,7 +352,9 @@ async def run_training(
                     backend=backend,
                 )
                 episodes = [episode for group in groups for episode in group]
-                transitions = compute_grouped_advantages(groups)
+                transitions = await _grouped_advantages(
+                    advantage_fn, groups, step=step, sampling_client=sampling_client,
+                )
         else:  # monte_carlo
             episodes = await collect_batch_async(
                 prompts,
@@ -394,7 +442,8 @@ async def run_training(
                 backend,
             )
 
-        # 8. Log metrics via MetricsLogger. MetricsLogger computes all rollout stats, namespaces training metrics under train/, records timing, and appends a JSONL line. Validation metrics (when present) are merged into the same record.
+        # 8. Log metrics via MetricsLogger. MetricsLogger computes all rollout stats, namespaces training metrics under train/, records timing, and appends a JSONL line. Validation metrics (when present) and the advantage function's own metrics (distillation) are merged into the same record.
+        extra_metrics = {**(val_metrics or {}), **_advantage_fn_metrics(advantage_fn)}
         metrics_record = metrics_logger.log_step(
             step=step,
             episodes=episodes,
@@ -405,7 +454,7 @@ async def run_training(
             step_total_seconds=step_total_seconds,
             effective_lr=effective_lr,
             kl_coef=getattr(args, 'kl_coef', 0.0),
-            extra_metrics=val_metrics,
+            extra_metrics=extra_metrics or None,
         )
 
         # 9. Console reporting: the compact row is the every-step heartbeat;
@@ -448,6 +497,7 @@ async def run_training_async(
     template_fn,
     validation_runner=None,
     checkpoint_manager=None,
+    advantage_fn=None,
 ) -> int:
     """Off-by-K (overlapped, bounded-staleness) RL training loop.
 
@@ -722,7 +772,13 @@ async def run_training_async(
             step = state.step
             groups = [wg.episodes for wg in batch]
             episodes = [ep for group in groups for ep in group]
-            transitions = compute_grouped_advantages(groups)
+            # The batch's groups may span several sampler versions; a teacher
+            # scores the tokens as sampled, so the current client is passed
+            # only for lagged self-teachers that snapshot the live policy.
+            transitions = await _grouped_advantages(
+                advantage_fn, groups, step=step,
+                sampling_client=state.sampling_client,
+            )
 
             # Staleness spread across the trained batch.
             staleness_vals = [step - wg.birth_step for wg in batch]
@@ -814,6 +870,7 @@ async def run_training_async(
             }
             if val_metrics:
                 timing_extras.update(val_metrics)
+            timing_extras.update(_advantage_fn_metrics(advantage_fn))
             metrics_record = metrics_logger.log_step(
                 step=step,
                 episodes=episodes,

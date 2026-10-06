@@ -52,6 +52,9 @@ and sampling.
 | [`chat_sft`](training_sessions_cookbook/recipes/chat_sft/) | Supervised fine-tuning on chat datasets (Tulu 3, UltraChat, local JSONL) | Tulu 3 NLL 1.23 → 0.65 in 400 steps |
 | [`gsm8k_rl`](training_sessions_cookbook/recipes/gsm8k_rl/) | RL on grade-school math (GSM8K) | reward 0.71 → 0.90 in 40 steps |
 | [`code_rl`](training_sessions_cookbook/recipes/code_rl/) | RL on competitive programming, graded by sandboxed execution | reward 0.46 → 0.60 in 50 steps |
+| [`opd_math`](training_sessions_cookbook/recipes/opd_math/) | On-policy distillation (OPD) on GSM8K; preset: the model's own base, sharpened (`--teacher_temperature`), as teacher | not yet validated |
+| [`opsd_math`](training_sessions_cookbook/recipes/opsd_math/) | On-policy self-distillation (OPSD): the frozen base, shown the worked solution, is the teacher | not yet validated |
+| [`sdpo_code`](training_sessions_cookbook/recipes/sdpo_code/) | Self-distillation (SDPO) on code: the frozen self, shown sandbox feedback and a passing sibling, is the teacher | not yet validated |
 
 Each recipe README has the exact commands, hyperparameters, and expected
 metrics. Shell launchers for all of them live in [`examples/`](examples/).

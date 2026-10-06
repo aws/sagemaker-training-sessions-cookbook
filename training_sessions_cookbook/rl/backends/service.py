@@ -412,7 +412,9 @@ class ServiceBackend:
         Slicing: ``tokens = obs + act``, ``input = tokens[:-1]``,
         ``target = tokens[1:]``, with per-token ``weights`` / ``logprobs`` /
         ``advantages`` zero over the ``obs_n - 1`` prompt positions and active
-        over the response. The service loss kernel does not take a per-datum
+        over the response. ``transition.advantage`` is either a scalar
+        (broadcast over the response) or a per-token list aligned with
+        ``act_tokens``. The service loss kernel does not take a per-datum
         ``temperature`` tensor, so ``temperature`` is accepted for signature
         parity but unused.
         """
@@ -427,7 +429,17 @@ class ServiceBackend:
 
         resp_n = len(input_tokens) - ob_len_m1
         logprobs_seq = [0.0] * ob_len_m1 + list(transition.act_logprobs)
-        advantages_seq = [0.0] * ob_len_m1 + [transition.advantage] * resp_n
+        # A scalar advantage is broadcast over the response (RL); a per-token
+        # list (on-policy distillation) is placed position-for-position.
+        if isinstance(transition.advantage, (list, tuple)):
+            assert len(transition.advantage) == act_n, (
+                f"per-token advantage has {len(transition.advantage)} values "
+                f"for {act_n} action tokens"
+            )
+            response_advantages = [float(a) for a in transition.advantage]
+        else:
+            response_advantages = [transition.advantage] * resp_n
+        advantages_seq = [0.0] * ob_len_m1 + response_advantages
         weights = [0.0] * ob_len_m1 + [1.0] * resp_n
 
         seq_len = len(input_tokens)

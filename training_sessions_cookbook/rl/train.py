@@ -509,7 +509,9 @@ def parse_with_config(parser: argparse.ArgumentParser, argv=None):
     return args
 
 
-async def run_async(args, *, env_factory=None, validation_runner=None) -> None:
+async def run_async(
+    args, *, env_factory=None, validation_runner=None, advantage_fn_factory=None,
+) -> None:
     """Drive one full training run from a parsed/constructed ``args`` object.
 
     This is the programmatic entry point: build ``args`` via
@@ -526,6 +528,12 @@ async def run_async(args, *, env_factory=None, validation_runner=None) -> None:
       sampling_client, tokenizer, template_fn, args, backend) -> dict``
       (see :class:`~.validation.ValidationRunner`); its metrics merge into
       each validation step's record.
+    - ``advantage_fn_factory``: ``async (args=, backend=, tokenizer=,
+      template_fn=) -> advantage_fn`` replacing the grouped GRPO advantage
+      stage (see "Pluggable advantage function" in ``loops.py``). Called once
+      the session is open; if the returned object has ``close()``, it is
+      called at teardown (on-policy distillation uses this to stop a teacher
+      session).
 
     The concrete clients are created by the service backend via
     ``make_backend(...)``, which opens the SageMaker Training Session and
@@ -675,7 +683,13 @@ async def run_async(args, *, env_factory=None, validation_runner=None) -> None:
         else run_training
     )
     _mlflow_status = "FAILED"
+    advantage_fn = None
     try:
+        if advantage_fn_factory is not None:
+            advantage_fn = await advantage_fn_factory(
+                args=args, backend=backend, tokenizer=tokenizer,
+                template_fn=template_fn,
+            )
         last_step = await _loop_fn(
             args,
             backend,
@@ -685,6 +699,7 @@ async def run_async(args, *, env_factory=None, validation_runner=None) -> None:
             template_fn=template_fn,
             validation_runner=validation_runner,
             checkpoint_manager=checkpoint_manager,
+            advantage_fn=advantage_fn,
         )
         if last_step is None:  # a custom loop that returns nothing
             last_step = max(args.max_steps - 1, 0)
@@ -734,13 +749,23 @@ async def run_async(args, *, env_factory=None, validation_runner=None) -> None:
         # session stop and the artifact upload both run to completion (a second
         # SIGINT still aborts the process; that trade-off is deliberate: one
         # Ctrl-C means "stop cleanly", two means "I accept the leak").
+        # The advantage function may own billed resources too (a teacher
+        # session), so it is closed first, synchronously, for the same reason.
+        _close_advantage_fn = getattr(advantage_fn, "close", None)
+        if _close_advantage_fn is not None:
+            try:
+                _close_advantage_fn()
+            except Exception as exc:  # best-effort; the student still stops
+                logging.getLogger(__name__).warning(
+                    "advantage_fn.close() failed: %r", exc)
         backend.close()
         # Uploads run-folder artifacts (metrics/config/validation/trajectories
         # jsonl) and closes the MLflow run with the right status.
         runlog.close(_mlflow_status)
 
 
-def run(args, *, env_factory=None, validation_runner=None) -> None:
+def run(args, *, env_factory=None, validation_runner=None,
+        advantage_fn_factory=None) -> None:
     """Synchronous wrapper around :func:`run_async` for scripts and the CLI.
 
     Raises a self-explanatory error when called from async code (e.g. a
@@ -758,6 +783,7 @@ def run(args, *, env_factory=None, validation_runner=None) -> None:
         )
     asyncio.run(run_async(
         args, env_factory=env_factory, validation_runner=validation_runner,
+        advantage_fn_factory=advantage_fn_factory,
     ))
 
 

@@ -9,6 +9,9 @@ same way: `python -m training_sessions_cookbook.recipes.<name>.train`.
 | [`gsm8k_rl/`](gsm8k_rl/) | RL on grade-school math (GSM8K) | `rl/` |
 | [`code_rl/`](code_rl/) | RL on competitive programming, sandbox-graded | `rl/` |
 | [`preference_kto/`](preference_kto/) | KTO preference alignment from binary labels | `preference/` |
+| [`opd_math/`](opd_math/) | On-policy distillation (GSM8K; same-model tempered teacher, or a checkpoint / second-model teacher) | `distill/` over `rl/` |
+| [`opsd_math/`](opsd_math/) | On-policy self-distillation with reference solutions (GSM8K) | `distill/` over `rl/` |
+| [`sdpo_code/`](sdpo_code/) | Self-distillation from sandbox feedback (code) | `distill/` over `rl/` |
 
 Every run writes `{run_folder}/metrics.jsonl` (one line per step) and
 `{run_folder}/checkpoints.jsonl` (the model-package ARN of every saved

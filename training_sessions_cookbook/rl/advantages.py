@@ -24,6 +24,25 @@ if TYPE_CHECKING:
 _ADV_EPS = 1e-8
 
 
+def advantage_values(transition: "Transition") -> list[float]:
+    """A transition's advantage as a flat list: ``[scalar]`` or the per-token list.
+
+    Advantages are a scalar per transition for RL (broadcast over every action
+    token at datum-build time) and a per-token list for on-policy distillation.
+    Metrics use this to treat both shapes uniformly.
+    """
+    adv = transition.advantage
+    if isinstance(adv, (list, tuple)):
+        return [float(a) for a in adv]
+    return [float(adv)]
+
+
+def mean_advantage(transition: "Transition") -> float:
+    """Scalar summary of a transition's advantage (the per-token mean when a list)."""
+    values = advantage_values(transition)
+    return sum(values) / len(values) if values else 0.0
+
+
 def compute_monte_carlo_advantages(
     episodes: "list[list[Transition]]",
     gamma: float,

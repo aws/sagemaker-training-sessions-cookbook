@@ -14,6 +14,7 @@ from typing import Optional
 
 from training_sessions_cookbook.service import append_metrics
 from training_sessions_cookbook.service.console import console_print, format_metric_values, print_kv_table
+from .advantages import advantage_values, mean_advantage
 from .config import cfg
 from .runstate import run_artifacts
 
@@ -45,11 +46,12 @@ def compute_reward_stats(episodes: list) -> dict:
 def compute_advantage_stats(transitions: list) -> dict:
     """Compute advantage_mean, advantage_std, advantage_min, advantage_max.
 
-    Operates on a flat list of Transition objects. Returns zeros when the list is empty.
+    Operates on a flat list of Transition objects. Returns zeros when the list is empty. Scalar advantages contribute one value per transition; per-token advantages (on-policy distillation) contribute one value per action token.
     """
-    if not transitions:
+    values = [v for t in transitions for v in advantage_values(t)]
+    if not values:
         return {"advantage_mean": 0.0, "advantage_std": 0.0, "advantage_min": 0.0, "advantage_max": 0.0}
-    arr = np.array([t.advantage for t in transitions])
+    arr = np.array(values)
     return {
         "advantage_mean": float(arr.mean()),
         "advantage_std": float(arr.std()),
@@ -186,7 +188,7 @@ def record_trajectories(
                     "prompt": _decode(t.obs_tokens),
                     "response": _decode(t.act_tokens),
                     "reward": float(t.reward),
-                    "advantage": float(t.advantage),
+                    "advantage": mean_advantage(t),
                     "done": bool(t.done),
                     "num_prompt_tokens": len(t.obs_tokens),
                     "num_response_tokens": len(t.act_tokens),
@@ -218,7 +220,7 @@ def episodes_to_rollout_dicts(episodes: list, tokenizer, cap: int) -> list:
                 "prompt": _decode(t.obs_tokens),
                 "response": _decode(t.act_tokens),
                 "reward": float(t.reward),
-                "advantage": float(t.advantage),
+                "advantage": mean_advantage(t),
                 "done": bool(t.done),
             }
             for t in episode
