@@ -6,7 +6,7 @@ boto3
 
 # Direct deps of this cookbook.
 numpy==2.5.0
-transformers==5.5.4
+transformers==5.10.1
 pyarrow
 psutil>=5.9,<7
 pydantic
