@@ -46,7 +46,7 @@ def open_session(
     """
     # Lazy import so merely importing the ``service`` package (e.g. for the
     # read_jsonl / metrics helpers, or during test collection) never requires
-    # the ``sagemaker-train`` SDK wheel to be installed. The SDK is only
+    # the ``sagemaker-train`` SDK to be installed. The SDK is only
     # needed when a session is actually opened.
     from sagemaker.train.training_session import ServiceClient
 

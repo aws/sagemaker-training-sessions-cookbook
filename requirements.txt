@@ -1,12 +1,7 @@
 # Standalone RL cookbook runtime requirements (SageMaker Training
 # Sessions service backend).
-#
-# The training-session PySDK ships as a wheel, not on PyPI, so it is installed
-# separately (see README.md "Setup"):
-#   pip install sagemaker-train-<version>-py3-none-any.whl
-# It pulls in the sagemaker + boto3 stack it needs. We list boto3/sagemaker
-# here as well so a fresh env resolves them even if the wheel's deps drift.
-sagemaker
+
+sagemaker-train>=1.25.0
 boto3
 
 # Direct deps of this cookbook.
