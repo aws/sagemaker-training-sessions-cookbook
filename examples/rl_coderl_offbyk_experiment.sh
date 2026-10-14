@@ -57,7 +57,7 @@
 #    are treated as already-supported/tested on the service.)
 #
 # 3. Install the PySDK + code-RL deps:
-#        pip install sagemaker-train-*.whl aiohttp datasets numpy
+#        pip install sagemaker-train aiohttp datasets numpy
 #
 # 4. SandboxFusion container for code grading, reachable at $SANDBOX_URL:
 #        docker run -d -p 8080:8080 volcengine/sandbox-fusion:server-20250609

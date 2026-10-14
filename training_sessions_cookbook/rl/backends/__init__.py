@@ -7,7 +7,7 @@ The concrete backend:
 * ``service``: SageMaker Training Sessions via the ``sagemaker-train`` PySDK.
 
 The backend module is imported lazily inside :func:`make_backend` so building the
-CLI (or running SDK-free tests) never requires the PySDK wheel to be installed.
+CLI (or running SDK-free tests) never requires the sagemaker-train SDK to be installed.
 
 ``make_backend(name, args)`` is the single entry point ``main()`` uses.
 """

@@ -4,7 +4,7 @@
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
-pip install --upgrade sagemaker-train  # the training-session SDK
+pip install 'sagemaker-train>=1.25.0'  # the training-session SDK
 pip install -e '.[dev]'
 ```
 

@@ -65,7 +65,7 @@ class _Sdk:
     """The SDK loss/optimizer types the loop needs, resolved lazily.
 
     Bundling them lets the module import (and its pure helpers be tested)
-    without the ``sagemaker-train`` wheel; :func:`_resolve_sdk` fills it in once
+    without the ``sagemaker-train`` SDK; :func:`_resolve_sdk` fills it in once
     a run actually starts. ``fwd_loss`` is used for the no-grad forward passes
     (any loss works - we read per-token log-probs, not the loss value -
     cross-entropy needs only the target_tokens + weights every datum carries);

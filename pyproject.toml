@@ -5,15 +5,9 @@ description = "SFT and RL training cookbooks for SageMaker Training Sessions."
 readme = "README.md"
 requires-python = ">=3.11"
 
-# The training-session PySDK (sagemaker-train) ships as a wheel, not on PyPI,
-# so it is installed separately (see README.md "Setup"). It pulls in
-# the sagemaker + boto3 + transformers stack it needs; we list boto3/sagemaker
-# here too so a fresh env resolves them even if the wheel's deps drift.
 dependencies = [
-    # Console rendering (log formatting, run banner). The trainers degrade to
-    # plain text without it, but it is a first-class part of the terminal UX.
+    "sagemaker-train>=1.25.0",
     "rich",
-    "sagemaker",
     "boto3",
     "numpy==2.5.0",
     "transformers==5.5.4",
